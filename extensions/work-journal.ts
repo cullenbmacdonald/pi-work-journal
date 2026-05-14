@@ -306,6 +306,9 @@ type ReviewAction = "write" | "edit" | "cancel";
 class JournalReviewOverlay implements Focusable {
 	focused = false;
 	private selected = 0;
+	private scrollOffset = 0;
+	private readonly previewWindow = 24;
+	private readonly draftLines: string[];
 	private actions: Array<{ id: ReviewAction; label: string }> = [
 		{ id: "write", label: "Write" },
 		{ id: "edit", label: "Edit" },
@@ -316,18 +319,52 @@ class JournalReviewOverlay implements Focusable {
 		private theme: Theme,
 		private draft: string,
 		private done: (result: ReviewAction) => void,
-	) {}
+	) {
+		this.draftLines = draft.split("\n");
+	}
+
+	private maxScrollOffset(): number {
+		return Math.max(0, this.draftLines.length - this.previewWindow);
+	}
+
+	private scrollBy(delta: number): void {
+		this.scrollOffset = Math.max(0, Math.min(this.maxScrollOffset(), this.scrollOffset + delta));
+	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape")) {
 			this.done("cancel");
 			return;
 		}
-		if (matchesKey(data, "left") || matchesKey(data, "up")) {
+		if (matchesKey(data, "up") || data === "k") {
+			this.scrollBy(-1);
+			return;
+		}
+		if (matchesKey(data, "down") || data === "j") {
+			this.scrollBy(1);
+			return;
+		}
+		if (matchesKey(data, "pageup")) {
+			this.scrollBy(-this.previewWindow);
+			return;
+		}
+		if (matchesKey(data, "pagedown")) {
+			this.scrollBy(this.previewWindow);
+			return;
+		}
+		if (matchesKey(data, "home")) {
+			this.scrollOffset = 0;
+			return;
+		}
+		if (matchesKey(data, "end")) {
+			this.scrollOffset = this.maxScrollOffset();
+			return;
+		}
+		if (matchesKey(data, "left")) {
 			this.selected = Math.max(0, this.selected - 1);
 			return;
 		}
-		if (matchesKey(data, "right") || matchesKey(data, "down") || matchesKey(data, "tab")) {
+		if (matchesKey(data, "right") || matchesKey(data, "tab")) {
 			this.selected = Math.min(this.actions.length - 1, this.selected + 1);
 			return;
 		}
@@ -348,18 +385,25 @@ class JournalReviewOverlay implements Focusable {
 			return `${line.slice(0, Math.max(0, maxWidth - 1))}…`;
 		};
 
+		const end = Math.min(this.draftLines.length, this.scrollOffset + this.previewWindow);
+		const visible = this.draftLines.slice(this.scrollOffset, end);
+
 		const lines: string[] = [
 			border,
 			row(` ${this.theme.fg("accent", "Journal draft review")}`),
-			row(` ${this.theme.fg("dim", "Enter=select • arrows/tab=navigate • Esc=cancel")}`),
+			row(` ${clip(this.theme.fg("dim", "↑/↓ scroll • PgUp/PgDn jump • ←/→ actions • Enter select • Esc cancel"), inner - 2)}`),
+			row(` ${clip(this.theme.fg("dim", `Lines ${this.scrollOffset + 1}-${end} of ${this.draftLines.length}`), inner - 2)}`),
 			row(""),
 		];
 
-		for (const previewLine of this.draft.split("\n").slice(0, 18)) {
+		for (const previewLine of visible) {
 			lines.push(row(` ${clip(previewLine, inner - 2)}`));
 		}
-		if (this.draft.split("\n").length > 18) {
-			lines.push(row(` ${this.theme.fg("dim", "... (truncated)")}`));
+
+		if (visible.length < this.previewWindow) {
+			for (let i = 0; i < this.previewWindow - visible.length; i++) {
+				lines.push(row(""));
+			}
 		}
 
 		lines.push(row(""));
