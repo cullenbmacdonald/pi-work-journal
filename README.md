@@ -4,8 +4,8 @@ A standalone [Pi](https://pi.dev) extension package for writing daily work journ
 
 ## Features
 
-- `/journal` — summarize the current session into a structured worklog entry.
-- `/journal-write <markdown>` — manually append/write an entry.
+- `/journal` — runs journal drafting in an isolated session, shows an overlay review UI, and returns you to your original session.
+- `/journal-write <markdown>` — manually write an entry (heading/timestamp/project formatting is applied automatically).
 - `/journal-config` — show resolved configuration and today's target file.
 
 ## Install
