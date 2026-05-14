@@ -390,6 +390,39 @@ async function reviewDraftWithOverlay(ctx: ExtensionCommandContext, draft: strin
 	return action ?? "cancel";
 }
 
+async function reviewAndWriteLoop(
+	ctx: ExtensionCommandContext,
+	draftInitial: string,
+	range: WorkRange | undefined,
+): Promise<void> {
+	let draft = draftInitial.trim();
+	if (!draft) {
+		ctx.ui.notify("Journal draft generation failed: no assistant output found.", "error");
+		return;
+	}
+
+	let done = false;
+	while (!done) {
+		const action = await reviewDraftWithOverlay(ctx, draft);
+		if (action === "cancel") {
+			ctx.ui.notify("Journal cancelled", "warning");
+			done = true;
+			continue;
+		}
+		if (action === "edit") {
+			const edited = await ctx.ui.editor("Edit journal draft", draft);
+			if (edited?.trim()) {
+				draft = edited.trim();
+			}
+			continue;
+		}
+
+		const result = writeJournalEntry({ cwd: ctx.cwd, rawContent: draft, range });
+		ctx.ui.notify(`✅ Journal entry ${result.mode === "append" ? "appended" : "created"}:\n${result.filePath}`, "info");
+		done = true;
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("journal", {
 		description: "Generate journal draft in an isolated session, review in overlay, then write",
@@ -426,39 +459,20 @@ export default function (pi: ExtensionAPI) {
 				parentSession: originSessionFile,
 				withSession: async (newCtx) => {
 					await newCtx.sendUserMessage(instruction);
-					let draft = getLatestAssistantTextFromBranch(newCtx).trim();
-					if (!draft) {
-						newCtx.ui.notify("Journal draft generation failed: no assistant output found.", "error");
-					} else {
-						let done = false;
-						while (!done) {
-							const action = await reviewDraftWithOverlay(newCtx, draft);
-							if (action === "cancel") {
-								newCtx.ui.notify("Journal cancelled", "warning");
-								done = true;
-								continue;
-							}
-							if (action === "edit") {
-								const edited = await newCtx.ui.editor("Edit journal draft", draft);
-								if (edited?.trim()) {
-									draft = edited.trim();
-								}
-								continue;
-							}
+					await newCtx.waitForIdle();
+					const draft = getLatestAssistantTextFromBranch(newCtx).trim();
 
-							const result = writeJournalEntry({ cwd: newCtx.cwd, rawContent: draft, range });
-							newCtx.ui.notify(`✅ Journal entry ${result.mode === "append" ? "appended" : "created"}:\n${result.filePath}`, "info");
-							done = true;
-						}
+					if (!originSessionFile) {
+						await reviewAndWriteLoop(newCtx, draft, range);
+						return;
 					}
 
-					if (originSessionFile) {
-						await newCtx.switchSession(originSessionFile, {
-							withSession: async (originCtx) => {
-								originCtx.ui.notify("Returned to original session", "info");
-							},
-						});
-					}
+					await newCtx.switchSession(originSessionFile, {
+						withSession: async (originCtx) => {
+							await reviewAndWriteLoop(originCtx, draft, range);
+							originCtx.ui.notify("Journal draft was generated in an isolated session", "info");
+						},
+					});
 				},
 			});
 		},
