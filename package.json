@@ -1,0 +1,18 @@
+{
+  "name": "pi-work-journal",
+  "version": "0.1.0",
+  "description": "Work journal extension package for Pi",
+  "keywords": [
+    "pi-package"
+  ],
+  "author": "cullenbmacdonald <cmacdonald@justworks.com>",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
