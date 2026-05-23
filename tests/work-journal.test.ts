@@ -113,6 +113,24 @@ describe("work-journal helpers", () => {
 		expect(text).toContain("Title: EOD missing items");
 		expect(text).toContain("If everything is already covered");
 	});
+
+	it("normalizes fenced markdown model output", () => {
+		const input = "```markdown\n# 2026-05-22\n\n### 09:00 — proj: Start\n```";
+		expect(testables.normalizeModelMarkdownOutput(input)).toBe("# 2026-05-22\n\n### 09:00 — proj: Start");
+	});
+
+	it("normalizes reconcile draft by slicing from day header", () => {
+		const input =
+			"Written to /tmp/file.md\n\n# 2026-05-22\n\n### 09:00 — proj: Start\n\nBody";
+		expect(testables.normalizeReconcileDraft(input, "2026-05-22").startsWith("# 2026-05-22")).toBe(true);
+	});
+
+	it("rejects non-markdown reconcile summary text", () => {
+		const bad = "Written to /tmp/worklog.md. The journal covers 13 entries.";
+		expect(testables.isValidReconcileDraft(bad, "2026-05-22")).toBe(false);
+		const good = "# 2026-05-22\n\n### 09:00 — proj: Start";
+		expect(testables.isValidReconcileDraft(good, "2026-05-22")).toBe(true);
+	});
 });
 
 describe("extractMessagesFromSessionFile", () => {

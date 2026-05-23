@@ -444,6 +444,34 @@ function writeFullDailyJournalFile(cwd: string, fullMarkdown: string, targetDate
 	return { filePath };
 }
 
+function normalizeModelMarkdownOutput(raw: string): string {
+	let draft = raw.trim();
+	const fenced = draft.match(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/i);
+	if (fenced?.[1]) {
+		draft = fenced[1].trim();
+	}
+	return draft;
+}
+
+function normalizeReconcileDraft(raw: string, targetDate?: string): string {
+	const draft = normalizeModelMarkdownOutput(raw);
+	if (!targetDate) return draft;
+	const header = `# ${targetDate}`;
+	const idx = draft.indexOf(header);
+	if (idx >= 0) {
+		return draft.slice(idx).trim();
+	}
+	return draft;
+}
+
+function isValidReconcileDraft(draft: string, targetDate?: string): boolean {
+	const normalized = draft.trim();
+	if (!normalized) return false;
+	if (targetDate && !normalized.startsWith(`# ${targetDate}`)) return false;
+	if (!/^#\s+\d{4}-\d{2}-\d{2}/.test(normalized)) return false;
+	return true;
+}
+
 function getLatestAssistantTextFromBranch(ctx: ExtensionCommandContext): string {
 	const entries = ctx.sessionManager.getBranch();
 	for (let i = entries.length - 1; i >= 0; i--) {
@@ -890,7 +918,7 @@ async function reviewAndRewriteDailyFileLoop(
 	draftInitial: string,
 	targetDate?: string,
 ): Promise<void> {
-	let draft = draftInitial.trim();
+	let draft = normalizeReconcileDraft(draftInitial, targetDate);
 	if (!draft) {
 		ctx.ui.notify("Journal reconcile failed: no assistant output found.", "error");
 		return;
@@ -908,6 +936,18 @@ async function reviewAndRewriteDailyFileLoop(
 			const edited = await ctx.ui.editor("Edit reconciled day log", draft);
 			if (edited?.trim()) {
 				draft = edited.trim();
+			}
+			continue;
+		}
+
+		if (!isValidReconcileDraft(draft, targetDate)) {
+			ctx.ui.notify(
+				"Reconcile draft does not look like a full markdown day file (missing `# YYYY-MM-DD` header). Please edit before writing.",
+				"warning",
+			);
+			const edited = await ctx.ui.editor("Edit reconciled day log", draft);
+			if (edited?.trim()) {
+				draft = normalizeReconcileDraft(edited.trim(), targetDate);
 			}
 			continue;
 		}
@@ -1020,6 +1060,9 @@ export const __testables = {
 	formatSegmentsForPrompt,
 	buildReconcileInstruction,
 	buildEodMissingInstruction,
+	normalizeModelMarkdownOutput,
+	normalizeReconcileDraft,
+	isValidReconcileDraft,
 	extractMessagesFromSessionFile,
 	getAllSessionFilePaths,
 	collectMessagesAcrossAllSessions,
