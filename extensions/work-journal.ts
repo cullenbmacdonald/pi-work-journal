@@ -20,6 +20,10 @@ interface WorkJournalConfig {
 	vaultPath: string;
 	/** Filename pattern. Supports {{date}} (YYYY-MM-DD) and {{timestamp}} (ISO) */
 	filePattern: string;
+	/** Optional provider to use for journal generation/reconcile commands */
+	provider?: string;
+	/** Optional model id to use for journal generation/reconcile commands */
+	model?: string;
 }
 
 interface WorkRange {
@@ -163,6 +167,55 @@ async function ensureVaultDir(ctx: ExtensionCommandContext, vaultDir: string): P
 	return true;
 }
 
+async function withConfiguredJournalModel(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	run: () => Promise<void>,
+): Promise<void> {
+	const cfg = loadConfig(ctx.cwd);
+	const provider = cfg.provider?.trim();
+	const modelId = cfg.model?.trim();
+	if ((!provider && modelId) || (provider && !modelId)) {
+		ctx.ui.notify("Journal config model selection requires both provider and model. Using current model.", "warning");
+		await run();
+		return;
+	}
+	if (!provider || !modelId) {
+		await run();
+		return;
+	}
+
+	const targetModel = ctx.modelRegistry.find(provider, modelId);
+	if (!targetModel) {
+		ctx.ui.notify(`Configured journal model not found: ${provider}/${modelId}. Using current model.`, "warning");
+		await run();
+		return;
+	}
+
+	const currentModel = ctx.model;
+	const alreadyUsing = currentModel?.provider === targetModel.provider && currentModel?.id === targetModel.id;
+	if (alreadyUsing) {
+		await run();
+		return;
+	}
+
+	const switched = await pi.setModel(targetModel);
+	if (!switched) {
+		ctx.ui.notify(`Could not switch to configured journal model ${provider}/${modelId}. Using current model.`, "warning");
+		await run();
+		return;
+	}
+
+	ctx.ui.notify(`Using configured journal model: ${provider}/${modelId}`, "info");
+	try {
+		await run();
+	} finally {
+		if (currentModel && (currentModel.provider !== targetModel.provider || currentModel.id !== targetModel.id)) {
+			await pi.setModel(currentModel);
+		}
+	}
+}
+
 function extractMessageText(message: any): string {
 	const content = message?.content;
 	if (typeof content === "string") return content;
@@ -214,6 +267,26 @@ function getSessionFilePaths(sessionDir: string): string[] {
 		.map((name) => join(sessionDir, name));
 }
 
+function getAllSessionFilePaths(): string[] {
+	const sessionsRoot = join(getAgentDir(), "sessions");
+	if (!existsSync(sessionsRoot)) return [];
+	const files: string[] = [];
+	for (const dirName of readdirSync(sessionsRoot)) {
+		const dirPath = join(sessionsRoot, dirName);
+		try {
+			const entries = readdirSync(dirPath);
+			for (const entry of entries) {
+				if (entry.endsWith(".jsonl")) {
+					files.push(join(dirPath, entry));
+				}
+			}
+		} catch {
+			// skip non-directories or unreadable entries
+		}
+	}
+	return files;
+}
+
 function extractMessagesFromSessionFile(filePath: string, targetDate: string): MessageSlice[] {
 	const messages: MessageSlice[] = [];
 	let raw = "";
@@ -262,6 +335,33 @@ function collectTodayMessagesAcrossSessions(ctx: ExtensionCommandContext, target
 } {
 	const sessionDir = ctx.sessionManager.getSessionDir();
 	const files = getSessionFilePaths(sessionDir);
+	const all: MessageSlice[] = [];
+	let contributing = 0;
+
+	for (const filePath of files) {
+		const extracted = extractMessagesFromSessionFile(filePath, targetDate);
+		if (extracted.length > 0) {
+			contributing++;
+			all.push(...extracted);
+		}
+	}
+
+	const deduped = new Map<string, MessageSlice>();
+	for (const m of all) {
+		const key = `${m.timestampMs}:${m.role}:${m.text.slice(0, 140)}`;
+		if (!deduped.has(key)) deduped.set(key, m);
+	}
+
+	const messages = [...deduped.values()].sort((a, b) => a.timestampMs - b.timestampMs);
+	return { messages, scannedSessionCount: files.length, contributingSessionCount: contributing };
+}
+
+function collectMessagesAcrossAllSessions(targetDate: string): {
+	messages: MessageSlice[];
+	scannedSessionCount: number;
+	contributingSessionCount: number;
+} {
+	const files = getAllSessionFilePaths();
 	const all: MessageSlice[] = [];
 	let contributing = 0;
 
@@ -808,80 +908,83 @@ async function reviewAndRewriteDailyFileLoop(
 }
 
 async function runReconcileAndEodForDate(params: {
+	pi: ExtensionAPI;
 	ctx: ExtensionCommandContext;
 	targetDate: string;
 	noActivityMessage: string;
 	completionMessage: string;
 }): Promise<void> {
-	const { ctx, targetDate, noActivityMessage, completionMessage } = params;
-	const { vaultDir, filePath, fileExists } = resolveDatedFile(ctx.cwd, targetDate);
-	if (!(await ensureVaultDir(ctx, vaultDir))) return;
+	const { pi, ctx, targetDate, noActivityMessage, completionMessage } = params;
+	await withConfiguredJournalModel(pi, ctx, async () => {
+		const { vaultDir, filePath, fileExists } = resolveDatedFile(ctx.cwd, targetDate);
+		if (!(await ensureVaultDir(ctx, vaultDir))) return;
 
-	const project = getProjectName(ctx.cwd);
-	const dailyLink = getDailyLink(targetDate);
-	const originSessionFile = ctx.sessionManager.getSessionFile();
-	const { messages, scannedSessionCount, contributingSessionCount } = collectTodayMessagesAcrossSessions(ctx, targetDate);
-	const transcript = buildSessionTranscript(messages, 260);
-	const existingContent = fileExists ? readFileSync(filePath, "utf-8") : "";
+		const project = getProjectName(ctx.cwd);
+		const dailyLink = getDailyLink(targetDate);
+		const originSessionFile = ctx.sessionManager.getSessionFile();
+		const { messages, scannedSessionCount, contributingSessionCount } = collectMessagesAcrossAllSessions(targetDate);
+		const transcript = buildSessionTranscript(messages, 260);
+		const existingContent = fileExists ? readFileSync(filePath, "utf-8") : "";
 
-	if (!existingContent.trim() && messages.length === 0) {
-		ctx.ui.notify(noActivityMessage, "warning");
-		return;
-	}
+		if (!existingContent.trim() && messages.length === 0) {
+			ctx.ui.notify(noActivityMessage, "warning");
+			return;
+		}
 
-	const segments = splitIntoWorkSegments(messages, 90);
-	const segmentsText = formatSegmentsForPrompt(segments);
-	const reconcileInstruction = buildReconcileInstruction({
-		project,
-		cwd: ctx.cwd,
-		filePath,
-		existingContent,
-		dailyLink,
-		todayDate: targetDate,
-		sessionCount: scannedSessionCount,
-		contributingSessionCount,
-		segmentsText,
-		transcript,
-	});
+		const segments = splitIntoWorkSegments(messages, 90);
+		const segmentsText = formatSegmentsForPrompt(segments);
+		const reconcileInstruction = buildReconcileInstruction({
+			project,
+			cwd: ctx.cwd,
+			filePath,
+			existingContent,
+			dailyLink,
+			todayDate: targetDate,
+			sessionCount: scannedSessionCount,
+			contributingSessionCount,
+			segmentsText,
+			transcript,
+		});
 
-	await ctx.newSession({
-		parentSession: originSessionFile,
-		withSession: async (newCtx) => {
-			await newCtx.sendUserMessage(reconcileInstruction);
-			await newCtx.waitForIdle();
-			const reconcileDraft = getLatestAssistantTextFromBranch(newCtx).trim();
+		await ctx.newSession({
+			parentSession: originSessionFile,
+			withSession: async (newCtx) => {
+				await newCtx.sendUserMessage(reconcileInstruction);
+				await newCtx.waitForIdle();
+				const reconcileDraft = getLatestAssistantTextFromBranch(newCtx).trim();
 
-			const eodInstruction = buildEodMissingInstruction({
-				project,
-				cwd: ctx.cwd,
-				filePath,
-				fileExists: true,
-				existingContent: reconcileDraft || existingContent,
-				dailyLink,
-				todayDate: targetDate,
-				sessionCount: scannedSessionCount,
-				contributingSessionCount,
-				transcript,
-			});
-			await newCtx.sendUserMessage(eodInstruction);
-			await newCtx.waitForIdle();
-			const eodDraft = getLatestAssistantTextFromBranch(newCtx).trim();
-			const eodRange = getLastMessageRange(messages);
+				const eodInstruction = buildEodMissingInstruction({
+					project,
+					cwd: ctx.cwd,
+					filePath,
+					fileExists: true,
+					existingContent: reconcileDraft || existingContent,
+					dailyLink,
+					todayDate: targetDate,
+					sessionCount: scannedSessionCount,
+					contributingSessionCount,
+					transcript,
+				});
+				await newCtx.sendUserMessage(eodInstruction);
+				await newCtx.waitForIdle();
+				const eodDraft = getLatestAssistantTextFromBranch(newCtx).trim();
+				const eodRange = getLastMessageRange(messages);
 
-			if (!originSessionFile) {
-				await reviewAndRewriteDailyFileLoop(newCtx, reconcileDraft, targetDate);
-				await reviewAndWriteLoop(newCtx, eodDraft, eodRange, targetDate);
-				return;
-			}
+				if (!originSessionFile) {
+					await reviewAndRewriteDailyFileLoop(newCtx, reconcileDraft, targetDate);
+					await reviewAndWriteLoop(newCtx, eodDraft, eodRange, targetDate);
+					return;
+				}
 
-			await newCtx.switchSession(originSessionFile, {
-				withSession: async (originCtx) => {
-					await reviewAndRewriteDailyFileLoop(originCtx, reconcileDraft, targetDate);
-					await reviewAndWriteLoop(originCtx, eodDraft, eodRange, targetDate);
-					originCtx.ui.notify(completionMessage, "info");
-				},
-			});
-		},
+				await newCtx.switchSession(originSessionFile, {
+					withSession: async (originCtx) => {
+						await reviewAndRewriteDailyFileLoop(originCtx, reconcileDraft, targetDate);
+						await reviewAndWriteLoop(originCtx, eodDraft, eodRange, targetDate);
+						originCtx.ui.notify(completionMessage, "info");
+					},
+				});
+			},
+		});
 	});
 }
 
@@ -893,14 +996,18 @@ export const __testables = {
 	formatSegmentsForPrompt,
 	buildReconcileInstruction,
 	buildEodMissingInstruction,
+	extractMessagesFromSessionFile,
+	getAllSessionFilePaths,
+	collectMessagesAcrossAllSessions,
 };
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("journal", {
 		description: "Generate journal draft in an isolated session, review in overlay, then write",
 		handler: async (_args, ctx) => {
-			const { vaultDir, filePath, fileExists } = resolveDailyFile(ctx.cwd);
-			if (!(await ensureVaultDir(ctx, vaultDir))) return;
+			await withConfiguredJournalModel(pi, ctx, async () => {
+				const { vaultDir, filePath, fileExists } = resolveDailyFile(ctx.cwd);
+				if (!(await ensureVaultDir(ctx, vaultDir))) return;
 
 			const project = getProjectName(ctx.cwd);
 			const dailyLink = getTodayDailyLink();
@@ -927,25 +1034,26 @@ export default function (pi: ExtensionAPI) {
 				transcript,
 			});
 
-			await ctx.newSession({
-				parentSession: originSessionFile,
-				withSession: async (newCtx) => {
-					await newCtx.sendUserMessage(instruction);
-					await newCtx.waitForIdle();
-					const draft = getLatestAssistantTextFromBranch(newCtx).trim();
+				await ctx.newSession({
+					parentSession: originSessionFile,
+					withSession: async (newCtx) => {
+						await newCtx.sendUserMessage(instruction);
+						await newCtx.waitForIdle();
+						const draft = getLatestAssistantTextFromBranch(newCtx).trim();
 
-					if (!originSessionFile) {
-						await reviewAndWriteLoop(newCtx, draft, range);
-						return;
-					}
+						if (!originSessionFile) {
+							await reviewAndWriteLoop(newCtx, draft, range);
+							return;
+						}
 
-					await newCtx.switchSession(originSessionFile, {
-						withSession: async (originCtx) => {
-							await reviewAndWriteLoop(originCtx, draft, range);
-							originCtx.ui.notify("Journal draft was generated in an isolated session", "info");
-						},
-					});
-				},
+						await newCtx.switchSession(originSessionFile, {
+							withSession: async (originCtx) => {
+								await reviewAndWriteLoop(originCtx, draft, range);
+								originCtx.ui.notify("Journal draft was generated in an isolated session", "info");
+							},
+						});
+					},
+				});
 			});
 		},
 	});
@@ -967,21 +1075,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("journal-reconcile", {
-		description: "Rewrite today's full journal by reconciling all today's sessions and existing entries",
-		handler: async (_args, ctx) => {
-			const { vaultDir, filePath } = resolveDailyFile(ctx.cwd);
-			if (!(await ensureVaultDir(ctx, vaultDir))) return;
-
-			const todayDate = getTodayDateString();
+		description: "Rewrite a day's full journal by reconciling all sessions and existing entries. Optional: /journal-reconcile YYYY-MM-DD",
+		handler: async (args, ctx) => {
+			await withConfiguredJournalModel(pi, ctx, async () => {
+				const argDate = args.trim();
+				const todayDate = argDate && isIsoDateString(argDate) ? argDate : getTodayDateString();
+				const { vaultDir, filePath } = resolveDatedFile(ctx.cwd, todayDate);
+				if (!(await ensureVaultDir(ctx, vaultDir))) return;
 			const project = getProjectName(ctx.cwd);
-			const dailyLink = getTodayDailyLink();
+			const dailyLink = getDailyLink(todayDate);
 			const originSessionFile = ctx.sessionManager.getSessionFile();
-			const { messages, scannedSessionCount, contributingSessionCount } = collectTodayMessagesAcrossSessions(ctx, todayDate);
+			const { messages, scannedSessionCount, contributingSessionCount } = collectMessagesAcrossAllSessions(todayDate);
 			const transcript = buildSessionTranscript(messages, 240);
 			const existingContent = existsSync(filePath) ? readFileSync(filePath, "utf-8") : "";
 
 			if (!existingContent.trim() && messages.length === 0) {
-				ctx.ui.notify("No journal content or session activity found for today.", "warning");
+				ctx.ui.notify(`No journal content or session activity found for ${todayDate}.`, "warning");
 				return;
 			}
 
@@ -1000,25 +1109,26 @@ export default function (pi: ExtensionAPI) {
 				transcript,
 			});
 
-			await ctx.newSession({
-				parentSession: originSessionFile,
-				withSession: async (newCtx) => {
-					await newCtx.sendUserMessage(instruction);
-					await newCtx.waitForIdle();
-					const draft = getLatestAssistantTextFromBranch(newCtx).trim();
+				await ctx.newSession({
+					parentSession: originSessionFile,
+					withSession: async (newCtx) => {
+						await newCtx.sendUserMessage(instruction);
+						await newCtx.waitForIdle();
+						const draft = getLatestAssistantTextFromBranch(newCtx).trim();
 
-					if (!originSessionFile) {
-						await reviewAndRewriteDailyFileLoop(newCtx, draft);
-						return;
-					}
+						if (!originSessionFile) {
+							await reviewAndRewriteDailyFileLoop(newCtx, draft, todayDate);
+							return;
+						}
 
-					await newCtx.switchSession(originSessionFile, {
-						withSession: async (originCtx) => {
-							await reviewAndRewriteDailyFileLoop(originCtx, draft);
-							originCtx.ui.notify("Journal reconcile draft was generated in an isolated session", "info");
-						},
-					});
-				},
+						await newCtx.switchSession(originSessionFile, {
+							withSession: async (originCtx) => {
+								await reviewAndRewriteDailyFileLoop(originCtx, draft, todayDate);
+								originCtx.ui.notify("Journal reconcile draft was generated in an isolated session", "info");
+							},
+						});
+					},
+				});
 			});
 		},
 	});
@@ -1026,14 +1136,15 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("journal-eod", {
 		description: "Generate an EOD note with only missing follow-ups/loose ends not already in journal",
 		handler: async (_args, ctx) => {
-			const { vaultDir, filePath, fileExists } = resolveDailyFile(ctx.cwd);
-			if (!(await ensureVaultDir(ctx, vaultDir))) return;
+			await withConfiguredJournalModel(pi, ctx, async () => {
+				const { vaultDir, filePath, fileExists } = resolveDailyFile(ctx.cwd);
+				if (!(await ensureVaultDir(ctx, vaultDir))) return;
 
 			const todayDate = getTodayDateString();
 			const project = getProjectName(ctx.cwd);
 			const dailyLink = getTodayDailyLink();
 			const originSessionFile = ctx.sessionManager.getSessionFile();
-			const { messages, scannedSessionCount, contributingSessionCount } = collectTodayMessagesAcrossSessions(ctx, todayDate);
+			const { messages, scannedSessionCount, contributingSessionCount } = collectMessagesAcrossAllSessions(todayDate);
 			const transcript = buildSessionTranscript(messages, 180);
 			const existingContent = fileExists ? readFileSync(filePath, "utf-8") : "";
 
@@ -1055,25 +1166,26 @@ export default function (pi: ExtensionAPI) {
 				transcript,
 			});
 
-			await ctx.newSession({
-				parentSession: originSessionFile,
-				withSession: async (newCtx) => {
-					await newCtx.sendUserMessage(instruction);
-					await newCtx.waitForIdle();
-					const draft = getLatestAssistantTextFromBranch(newCtx).trim();
+				await ctx.newSession({
+					parentSession: originSessionFile,
+					withSession: async (newCtx) => {
+						await newCtx.sendUserMessage(instruction);
+						await newCtx.waitForIdle();
+						const draft = getLatestAssistantTextFromBranch(newCtx).trim();
 
-					if (!originSessionFile) {
-						await reviewAndWriteLoop(newCtx, draft, undefined);
-						return;
-					}
+						if (!originSessionFile) {
+							await reviewAndWriteLoop(newCtx, draft, undefined);
+							return;
+						}
 
-					await newCtx.switchSession(originSessionFile, {
-						withSession: async (originCtx) => {
-							await reviewAndWriteLoop(originCtx, draft, undefined);
-							originCtx.ui.notify("EOD missing-items draft was generated in an isolated session", "info");
-						},
-					});
-				},
+						await newCtx.switchSession(originSessionFile, {
+							withSession: async (originCtx) => {
+								await reviewAndWriteLoop(originCtx, draft, undefined);
+								originCtx.ui.notify("EOD missing-items draft was generated in an isolated session", "info");
+							},
+						});
+					},
+				});
 			});
 		},
 	});
@@ -1087,6 +1199,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			await runReconcileAndEodForDate({
+				pi,
 				ctx,
 				targetDate,
 				noActivityMessage: `No journal content or session activity found for ${targetDate}.`,
@@ -1100,6 +1213,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const targetDate = getDateString(-1);
 			await runReconcileAndEodForDate({
+				pi,
 				ctx,
 				targetDate,
 				noActivityMessage: "No journal content or session activity found for yesterday.",
@@ -1119,6 +1233,8 @@ export default function (pi: ExtensionAPI) {
 				`  Resolved:      ${vaultDir}`,
 				`  Exists:        ${existsSync(vaultDir) ? "yes" : "NO — will be created on first use"}`,
 				`  File pattern:  ${config.filePattern}`,
+				`  Provider:      ${config.provider ?? "(default/current)"}`,
+				`  Model:         ${config.model ?? "(default/current)"}`,
 				`  Today's file:  ${filePath}`,
 				`  File exists:   ${fileExists ? "yes (will append)" : "no (will create)"}`,
 				"",

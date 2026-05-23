@@ -15,6 +15,14 @@ It supports:
 
 The extension writes to a date-based markdown file in your configured `vaultPath`.
 
+If configured, journal generation commands can also switch to a specific provider/model for drafting (`provider` + `model`).
+
+### Session scanning
+
+Reconcile and EOD commands scan **all** Pi session directories — not just the current project. This means activity across every project you worked on that day is captured in one journal file.
+
+Session files are stored under `~/.pi/agent/sessions/<project-slug>/` as `.jsonl` files. The global scan walks every project subdirectory and filters messages by the target date.
+
 ### Entry format
 
 For normal entries, it writes headings like:
@@ -44,37 +52,46 @@ For generation commands, it:
 ## Commands
 
 ### `/journal`
-Drafts a journal entry from the **current branch/session context** and appends it to today’s file.
+Drafts a journal entry from the **current branch/session context** and appends it to today's file.
 
 Use this during the day when you remember to log progress.
+
+> Note: This is the only command that scans only the current project session — it's about capturing what you're working on right now.
 
 ### `/journal-write <markdown>`
 Manually append an entry. The extension still applies heading/timestamp/project formatting automatically.
 
-### `/journal-reconcile`
-Performs a **full reconcile for today**:
+### `/journal-reconcile [YYYY-MM-DD]`
+Performs a **full reconcile** for a given date (defaults to today):
 
-- scans all today’s Pi sessions,
-- reads today’s current journal,
+- scans **all** Pi session directories for activity on that date,
+- reads the current journal file for that date,
 - detects major work segments from message time gaps,
 - generates a reconstructed full-day file,
-- **rewrites today’s file** so it reads like you journaled at key moments.
+- **rewrites the day file** so it reads like you journaled at key moments.
+
+Examples:
+
+```bash
+/journal-reconcile            # reconcile today
+/journal-reconcile 2026-05-20 # reconcile a specific date
+```
 
 ### `/journal-eod`
 Performs an **EOD missing-only pass for today**:
 
-- compares today’s session activity vs today’s full journal,
+- compares **all** session activity from today vs today's full journal,
 - appends only missing follow-ups/loose ends/TODOs,
 - avoids re-listing things already captured.
 
 ### `/journal-yesterday`
 Runs yesterday catch-up in one command:
 
-1. reconcile yesterday’s full log,
-2. append yesterday’s missing-only EOD note.
+1. reconcile yesterday's full log,
+2. append yesterday's missing-only EOD note.
 
 ### `/journal-date YYYY-MM-DD`
-Same as `/journal-yesterday`, but for any explicit date.
+Same as `/journal-yesterday`, but for any explicit date. Runs reconcile + EOD in one flow.
 
 Example:
 
@@ -128,8 +145,10 @@ Example:
 
 ```json
 {
-  "vaultPath": "~/Documents/Obsidian/MyVault/work-journal",
-  "filePattern": "{{date}}.md"
+  "vaultPath": "~/Documents/personal notes/02 - areas/worklogs",
+  "filePattern": "{{date}}-worklog.md",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-20250514"
 }
 ```
 
@@ -137,3 +156,13 @@ Supported filename placeholders:
 
 - `{{date}}` → `YYYY-MM-DD`
 - `{{timestamp}}` → ISO timestamp (filesystem-safe)
+
+Optional model selection keys:
+
+- `provider` — model provider id
+- `model` — model id
+
+Notes:
+
+- `provider` and `model` must be set together.
+- When set, generation commands (`/journal`, `/journal-reconcile`, `/journal-eod`, `/journal-yesterday`, `/journal-date`) use that model for drafting and then restore your previous model afterward.
