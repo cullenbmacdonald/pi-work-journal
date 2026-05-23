@@ -199,7 +199,14 @@ async function withConfiguredJournalModel(
 		return;
 	}
 
-	const switched = await pi.setModel(targetModel);
+	let switched = false;
+	try {
+		switched = await pi.setModel(targetModel);
+	} catch (e) {
+		ctx.ui.notify(`Could not switch to configured journal model ${provider}/${modelId} (${e}). Using current model.`, "warning");
+		await run();
+		return;
+	}
 	if (!switched) {
 		ctx.ui.notify(`Could not switch to configured journal model ${provider}/${modelId}. Using current model.`, "warning");
 		await run();
@@ -211,7 +218,11 @@ async function withConfiguredJournalModel(
 		await run();
 	} finally {
 		if (currentModel && (currentModel.provider !== targetModel.provider || currentModel.id !== targetModel.id)) {
-			await pi.setModel(currentModel);
+			try {
+				await pi.setModel(currentModel);
+			} catch {
+				// Session/runtime may have been replaced during /journal flows; ignore restore failures.
+			}
 		}
 	}
 }
