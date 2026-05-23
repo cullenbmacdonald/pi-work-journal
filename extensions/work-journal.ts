@@ -9,7 +9,7 @@
  * - <cwd>/.pi/work-journal.json (project-local)
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -27,10 +27,16 @@ interface WorkRange {
 	endMs: number;
 }
 
+interface WorkSegment {
+	range: WorkRange;
+	messageCount: number;
+}
+
 interface MessageSlice {
 	role: string;
 	text: string;
 	timestampMs: number;
+	sourceSession?: string;
 }
 
 const DEFAULT_CONFIG: WorkJournalConfig = {
@@ -71,19 +77,35 @@ function loadConfig(cwd: string): WorkJournalConfig {
 	return { ...DEFAULT_CONFIG, ...globalConfig, ...projectConfig };
 }
 
-function resolveFilename(pattern: string): string {
+function resolveFilename(pattern: string, dateString?: string): string {
 	const now = new Date();
-	const date = now.toISOString().split("T")[0];
+	const date = dateString ?? now.toISOString().split("T")[0];
 	const timestamp = now.toISOString().replace(/[:.]/g, "-");
 	return pattern.replace(/\{\{date\}\}/g, date).replace(/\{\{timestamp\}\}/g, timestamp);
 }
 
+function getDateString(dayOffset = 0): string {
+	const d = new Date();
+	d.setDate(d.getDate() + dayOffset);
+	return d.toISOString().split("T")[0];
+}
+
 function getTodayDateString(): string {
-	return new Date().toISOString().split("T")[0];
+	return getDateString(0);
+}
+
+function isIsoDateString(value: string): boolean {
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+	const d = new Date(`${value}T00:00:00.000Z`);
+	return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
+}
+
+function getDailyLink(dateString: string): string {
+	return `[[${dateString}]]`;
 }
 
 function getTodayDailyLink(): string {
-	return `[[${getTodayDateString()}]]`;
+	return getDailyLink(getTodayDateString());
 }
 
 function getProjectName(cwd: string): string {
@@ -105,7 +127,7 @@ function formatRange(range?: WorkRange): string {
 	return start === end ? start : `${start}–${end}`;
 }
 
-function resolveDailyFile(cwd: string): {
+function resolveDatedFile(cwd: string, dateString: string): {
 	config: WorkJournalConfig;
 	vaultDir: string;
 	filePath: string;
@@ -113,9 +135,18 @@ function resolveDailyFile(cwd: string): {
 } {
 	const config = loadConfig(cwd);
 	const vaultDir = expandHome(config.vaultPath);
-	const filename = resolveFilename(config.filePattern);
+	const filename = resolveFilename(config.filePattern, dateString);
 	const filePath = join(vaultDir, filename);
 	return { config, vaultDir, filePath, fileExists: existsSync(filePath) };
+}
+
+function resolveDailyFile(cwd: string): {
+	config: WorkJournalConfig;
+	vaultDir: string;
+	filePath: string;
+	fileExists: boolean;
+} {
+	return resolveDatedFile(cwd, getTodayDateString());
 }
 
 async function ensureVaultDir(ctx: ExtensionCommandContext, vaultDir: string): Promise<boolean> {
@@ -170,9 +201,136 @@ function buildSessionTranscript(messages: MessageSlice[], maxMessages = 40): str
 	return recent
 		.map((m) => {
 			const clipped = m.text.length > 700 ? `${m.text.slice(0, 700)}\n... (truncated)` : m.text;
-			return `[${new Date(m.timestampMs).toISOString()}] ${m.role}:\n${clipped}`;
+			const source = m.sourceSession ? ` (${m.sourceSession})` : "";
+			return `[${new Date(m.timestampMs).toISOString()}]${source} ${m.role}:\n${clipped}`;
 		})
 		.join("\n\n");
+}
+
+function getSessionFilePaths(sessionDir: string): string[] {
+	if (!sessionDir || !existsSync(sessionDir)) return [];
+	return readdirSync(sessionDir)
+		.filter((name) => name.endsWith(".jsonl"))
+		.map((name) => join(sessionDir, name));
+}
+
+function extractMessagesFromSessionFile(filePath: string, targetDate: string): MessageSlice[] {
+	const messages: MessageSlice[] = [];
+	let raw = "";
+	try {
+		raw = readFileSync(filePath, "utf-8");
+	} catch {
+		return messages;
+	}
+
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let entry: any;
+		try {
+			entry = JSON.parse(trimmed);
+		} catch {
+			continue;
+		}
+		if (entry?.type !== "message") continue;
+		const role = entry?.message?.role;
+		if (role !== "user" && role !== "assistant") continue;
+		const text = extractMessageText(entry.message);
+		if (!text) continue;
+
+		const tsFromMessage = entry?.message?.timestamp;
+		const fallbackTs = new Date(entry?.timestamp).getTime();
+		const timestampMs = typeof tsFromMessage === "number" ? tsFromMessage : fallbackTs;
+		if (!Number.isFinite(timestampMs)) continue;
+		if (!new Date(timestampMs).toISOString().startsWith(targetDate)) continue;
+
+		messages.push({
+			role,
+			text,
+			timestampMs,
+			sourceSession: basename(filePath),
+		});
+	}
+
+	return messages;
+}
+
+function collectTodayMessagesAcrossSessions(ctx: ExtensionCommandContext, targetDate: string): {
+	messages: MessageSlice[];
+	scannedSessionCount: number;
+	contributingSessionCount: number;
+} {
+	const sessionDir = ctx.sessionManager.getSessionDir();
+	const files = getSessionFilePaths(sessionDir);
+	const all: MessageSlice[] = [];
+	let contributing = 0;
+
+	for (const filePath of files) {
+		const extracted = extractMessagesFromSessionFile(filePath, targetDate);
+		if (extracted.length > 0) {
+			contributing++;
+			all.push(...extracted);
+		}
+	}
+
+	const deduped = new Map<string, MessageSlice>();
+	for (const m of all) {
+		const key = `${m.timestampMs}:${m.role}:${m.text.slice(0, 140)}`;
+		if (!deduped.has(key)) deduped.set(key, m);
+	}
+
+	const messages = [...deduped.values()].sort((a, b) => a.timestampMs - b.timestampMs);
+	return { messages, scannedSessionCount: files.length, contributingSessionCount: contributing };
+}
+
+function splitIntoWorkSegments(messages: MessageSlice[], gapMinutes = 90): WorkSegment[] {
+	if (messages.length === 0) return [];
+	const thresholdMs = gapMinutes * 60 * 1000;
+	const segments: WorkSegment[] = [];
+
+	let start = messages[0]!.timestampMs;
+	let prev = messages[0]!.timestampMs;
+	let count = 1;
+
+	for (let i = 1; i < messages.length; i++) {
+		const ts = messages[i]!.timestampMs;
+		if (ts - prev >= thresholdMs) {
+			segments.push({ range: { startMs: start, endMs: prev }, messageCount: count });
+			start = ts;
+			count = 1;
+		} else {
+			count++;
+		}
+		prev = ts;
+	}
+
+	segments.push({ range: { startMs: start, endMs: prev }, messageCount: count });
+	return segments;
+}
+
+function formatSegmentsForPrompt(segments: WorkSegment[]): string {
+	if (segments.length === 0) return "(no activity segments found)";
+	return segments
+		.map((s, idx) => `- Segment ${idx + 1}: ${formatRange(s.range)} (${s.messageCount} msgs)`)
+		.join("\n");
+}
+
+function getLastMessageRange(messages: MessageSlice[]): WorkRange | undefined {
+	if (messages.length === 0) return undefined;
+	const ts = messages[messages.length - 1]!.timestampMs;
+	return { startMs: ts, endMs: ts };
+}
+
+function writeFullDailyJournalFile(cwd: string, fullMarkdown: string, targetDate?: string): { filePath: string } {
+	const dateString = targetDate ?? getTodayDateString();
+	const { vaultDir, filePath } = resolveDatedFile(cwd, dateString);
+	if (!existsSync(vaultDir)) {
+		mkdirSync(vaultDir, { recursive: true });
+	}
+
+	const normalized = fullMarkdown.trim().replace(/\s+$/g, "");
+	writeFileSync(filePath, `${normalized}\n`, "utf-8");
+	return { filePath };
 }
 
 function getLatestAssistantTextFromBranch(ctx: ExtensionCommandContext): string {
@@ -220,9 +378,15 @@ function formatEntryMarkdown(content: string, cwd: string, range?: WorkRange): s
 	return `${heading}\n\n${body.trim()}`.trim();
 }
 
-function writeJournalEntry(params: { cwd: string; rawContent: string; range?: WorkRange }): { filePath: string; mode: "append" | "create" } {
-	const { cwd, rawContent, range } = params;
-	const { vaultDir, filePath, fileExists } = resolveDailyFile(cwd);
+function writeJournalEntry(params: {
+	cwd: string;
+	rawContent: string;
+	range?: WorkRange;
+	targetDate?: string;
+}): { filePath: string; mode: "append" | "create" } {
+	const { cwd, rawContent, range, targetDate } = params;
+	const dateString = targetDate ?? getTodayDateString();
+	const { vaultDir, filePath, fileExists } = resolveDatedFile(cwd, dateString);
 
 	if (!existsSync(vaultDir)) {
 		mkdirSync(vaultDir, { recursive: true });
@@ -235,7 +399,7 @@ function writeJournalEntry(params: { cwd: string; rawContent: string; range?: Wo
 		return { filePath, mode: "append" };
 	}
 
-	const dateHeader = `# ${getTodayDateString()}`;
+	const dateHeader = `# ${dateString}`;
 	writeFileSync(filePath, `${dateHeader}\n\n${entryMarkdown}\n`, "utf-8");
 	return { filePath, mode: "create" };
 }
@@ -293,6 +457,148 @@ function buildJournalInstruction(params: {
 			: `No file exists yet for today. First write will create file header automatically (# ${getTodayDateString()}).`,
 		"",
 		"Session transcript excerpt:",
+		"```",
+		transcript || "(no transcript available)",
+		"```",
+		"",
+		"Return ONLY the markdown output in the specified format. No code fences.",
+	].join("\n");
+}
+
+function buildReconcileInstruction(params: {
+	project: string;
+	cwd: string;
+	filePath: string;
+	existingContent: string;
+	dailyLink: string;
+	todayDate: string;
+	sessionCount: number;
+	contributingSessionCount: number;
+	segmentsText: string;
+	transcript: string;
+}): string {
+	const {
+		project,
+		cwd,
+		filePath,
+		existingContent,
+		dailyLink,
+		todayDate,
+		sessionCount,
+		contributingSessionCount,
+		segmentsText,
+		transcript,
+	} = params;
+
+	return [
+		"Reconstruct and reconcile the FULL daily worklog from today's Pi session activity.",
+		"",
+		"Goal: produce a complete rewritten day log that reads like the user journaled at key moments.",
+		"",
+		"## Output format (strict)",
+		"",
+		"Return the ENTIRE final daily markdown file, not a partial snippet.",
+		`Line 1 must be exactly: # ${todayDate}`,
+		"",
+		"For each work segment, create one journal entry with this heading style:",
+		"### HH:MM or HH:MM–HH:MM — <project>: <title>",
+		"",
+		"Separate entries with:",
+		"---",
+		"",
+		"Include all important work/decisions/todos from the transcript.",
+		"If something already exists in the journal, preserve it but merge/deduplicate.",
+		"Use checkbox TODOs (`- [ ] ...`) for open items.",
+		`Include daily-note link somewhere in the file: ${dailyLink}`,
+		"",
+		"## Segment hints (from message time gaps)",
+		segmentsText,
+		"",
+		"## Context",
+		`Date: ${todayDate}`,
+		`Project: ${project} (${cwd})`,
+		`Target file: ${filePath}`,
+		`Sessions scanned: ${sessionCount} (${contributingSessionCount} with activity today)`,
+		"",
+		"Existing daily journal content (truncated):",
+		"```",
+		existingContent.slice(0, 7000) || "(none)",
+		existingContent.length > 7000 ? "\n... (truncated)" : "",
+		"```",
+		"",
+		"Today's session transcript excerpts:",
+		"```",
+		transcript || "(no transcript available)",
+		"```",
+		"",
+		"Return ONLY final markdown file contents. No code fences.",
+	].join("\n");
+}
+
+function buildEodMissingInstruction(params: {
+	project: string;
+	cwd: string;
+	filePath: string;
+	fileExists: boolean;
+	existingContent: string;
+	dailyLink: string;
+	todayDate: string;
+	sessionCount: number;
+	contributingSessionCount: number;
+	transcript: string;
+}): string {
+	const {
+		project,
+		cwd,
+		filePath,
+		fileExists,
+		existingContent,
+		dailyLink,
+		todayDate,
+		sessionCount,
+		contributingSessionCount,
+		transcript,
+	} = params;
+
+	return [
+		"Create an end-of-day note with ONLY items missing from today's work journal.",
+		"",
+		"Goal: compare today's Pi sessions against the full current worklog and list only follow-ups/loose ends/TODOs not already captured.",
+		"",
+		"## Output format (strict)",
+		"",
+		"Line 1 must be exactly: `Title: EOD missing items`",
+		"Then a blank line, then markdown body content only (no top heading).",
+		"",
+		"Sections:",
+		"- **Missing follow-ups / TODOs** (checkboxes: `- [ ] ...`)",
+		"- **Missing loose ends / risks**",
+		"- **Coverage notes** (1-3 bullets max)",
+		"",
+		"Rules:",
+		"- Include only items not already represented in the journal.",
+		"- If everything is already covered, output: `- Nothing missing; journal appears reconciled.`",
+		"- Be concrete and deduplicated.",
+		`- Include daily-note link somewhere: ${dailyLink}`,
+		"",
+		"## Context",
+		"",
+		`Date: ${todayDate}`,
+		`Project: ${project} (${cwd})`,
+		`Target file: ${filePath}`,
+		`Sessions scanned: ${sessionCount} (${contributingSessionCount} with activity today)`,
+		fileExists
+			? [
+					"",
+					"Existing FULL work journal content for today (truncated):",
+					"```",
+					existingContent.slice(0, 7000),
+					existingContent.length > 7000 ? "\n... (truncated)" : "",
+					"```",
+			  ].join("\n")
+			: "No work-journal file exists yet for today.",
+		"",
+		"Pi session transcript excerpts for today:",
 		"```",
 		transcript || "(no transcript available)",
 		"```",
@@ -438,6 +744,7 @@ async function reviewAndWriteLoop(
 	ctx: ExtensionCommandContext,
 	draftInitial: string,
 	range: WorkRange | undefined,
+	targetDate?: string,
 ): Promise<void> {
 	let draft = draftInitial.trim();
 	if (!draft) {
@@ -461,11 +768,132 @@ async function reviewAndWriteLoop(
 			continue;
 		}
 
-		const result = writeJournalEntry({ cwd: ctx.cwd, rawContent: draft, range });
+		const result = writeJournalEntry({ cwd: ctx.cwd, rawContent: draft, range, targetDate });
 		ctx.ui.notify(`✅ Journal entry ${result.mode === "append" ? "appended" : "created"}:\n${result.filePath}`, "info");
 		done = true;
 	}
 }
+
+async function reviewAndRewriteDailyFileLoop(
+	ctx: ExtensionCommandContext,
+	draftInitial: string,
+	targetDate?: string,
+): Promise<void> {
+	let draft = draftInitial.trim();
+	if (!draft) {
+		ctx.ui.notify("Journal reconcile failed: no assistant output found.", "error");
+		return;
+	}
+
+	let done = false;
+	while (!done) {
+		const action = await reviewDraftWithOverlay(ctx, draft);
+		if (action === "cancel") {
+			ctx.ui.notify("Journal reconcile cancelled", "warning");
+			done = true;
+			continue;
+		}
+		if (action === "edit") {
+			const edited = await ctx.ui.editor("Edit reconciled day log", draft);
+			if (edited?.trim()) {
+				draft = edited.trim();
+			}
+			continue;
+		}
+
+		const result = writeFullDailyJournalFile(ctx.cwd, draft, targetDate);
+		ctx.ui.notify(`✅ Journal day file rewritten:\n${result.filePath}`, "info");
+		done = true;
+	}
+}
+
+async function runReconcileAndEodForDate(params: {
+	ctx: ExtensionCommandContext;
+	targetDate: string;
+	noActivityMessage: string;
+	completionMessage: string;
+}): Promise<void> {
+	const { ctx, targetDate, noActivityMessage, completionMessage } = params;
+	const { vaultDir, filePath, fileExists } = resolveDatedFile(ctx.cwd, targetDate);
+	if (!(await ensureVaultDir(ctx, vaultDir))) return;
+
+	const project = getProjectName(ctx.cwd);
+	const dailyLink = getDailyLink(targetDate);
+	const originSessionFile = ctx.sessionManager.getSessionFile();
+	const { messages, scannedSessionCount, contributingSessionCount } = collectTodayMessagesAcrossSessions(ctx, targetDate);
+	const transcript = buildSessionTranscript(messages, 260);
+	const existingContent = fileExists ? readFileSync(filePath, "utf-8") : "";
+
+	if (!existingContent.trim() && messages.length === 0) {
+		ctx.ui.notify(noActivityMessage, "warning");
+		return;
+	}
+
+	const segments = splitIntoWorkSegments(messages, 90);
+	const segmentsText = formatSegmentsForPrompt(segments);
+	const reconcileInstruction = buildReconcileInstruction({
+		project,
+		cwd: ctx.cwd,
+		filePath,
+		existingContent,
+		dailyLink,
+		todayDate: targetDate,
+		sessionCount: scannedSessionCount,
+		contributingSessionCount,
+		segmentsText,
+		transcript,
+	});
+
+	await ctx.newSession({
+		parentSession: originSessionFile,
+		withSession: async (newCtx) => {
+			await newCtx.sendUserMessage(reconcileInstruction);
+			await newCtx.waitForIdle();
+			const reconcileDraft = getLatestAssistantTextFromBranch(newCtx).trim();
+
+			const eodInstruction = buildEodMissingInstruction({
+				project,
+				cwd: ctx.cwd,
+				filePath,
+				fileExists: true,
+				existingContent: reconcileDraft || existingContent,
+				dailyLink,
+				todayDate: targetDate,
+				sessionCount: scannedSessionCount,
+				contributingSessionCount,
+				transcript,
+			});
+			await newCtx.sendUserMessage(eodInstruction);
+			await newCtx.waitForIdle();
+			const eodDraft = getLatestAssistantTextFromBranch(newCtx).trim();
+			const eodRange = getLastMessageRange(messages);
+
+			if (!originSessionFile) {
+				await reviewAndRewriteDailyFileLoop(newCtx, reconcileDraft, targetDate);
+				await reviewAndWriteLoop(newCtx, eodDraft, eodRange, targetDate);
+				return;
+			}
+
+			await newCtx.switchSession(originSessionFile, {
+				withSession: async (originCtx) => {
+					await reviewAndRewriteDailyFileLoop(originCtx, reconcileDraft, targetDate);
+					await reviewAndWriteLoop(originCtx, eodDraft, eodRange, targetDate);
+					originCtx.ui.notify(completionMessage, "info");
+				},
+			});
+		},
+	});
+}
+
+export const __testables = {
+	isIsoDateString,
+	resolveFilename,
+	extractTitleAndBody,
+	splitIntoWorkSegments,
+	formatSegmentsForPrompt,
+	buildReconcileInstruction,
+	buildEodMissingInstruction,
+};
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("journal", {
@@ -535,6 +963,148 @@ export default function (pi: ExtensionAPI) {
 
 			const result = writeJournalEntry({ cwd: ctx.cwd, rawContent: args.trim() });
 			ctx.ui.notify(`✅ Journal entry ${result.mode === "append" ? "appended" : "created"}:\n${result.filePath}`, "info");
+		},
+	});
+
+	pi.registerCommand("journal-reconcile", {
+		description: "Rewrite today's full journal by reconciling all today's sessions and existing entries",
+		handler: async (_args, ctx) => {
+			const { vaultDir, filePath } = resolveDailyFile(ctx.cwd);
+			if (!(await ensureVaultDir(ctx, vaultDir))) return;
+
+			const todayDate = getTodayDateString();
+			const project = getProjectName(ctx.cwd);
+			const dailyLink = getTodayDailyLink();
+			const originSessionFile = ctx.sessionManager.getSessionFile();
+			const { messages, scannedSessionCount, contributingSessionCount } = collectTodayMessagesAcrossSessions(ctx, todayDate);
+			const transcript = buildSessionTranscript(messages, 240);
+			const existingContent = existsSync(filePath) ? readFileSync(filePath, "utf-8") : "";
+
+			if (!existingContent.trim() && messages.length === 0) {
+				ctx.ui.notify("No journal content or session activity found for today.", "warning");
+				return;
+			}
+
+			const segments = splitIntoWorkSegments(messages, 90);
+			const segmentsText = formatSegmentsForPrompt(segments);
+			const instruction = buildReconcileInstruction({
+				project,
+				cwd: ctx.cwd,
+				filePath,
+				existingContent,
+				dailyLink,
+				todayDate,
+				sessionCount: scannedSessionCount,
+				contributingSessionCount,
+				segmentsText,
+				transcript,
+			});
+
+			await ctx.newSession({
+				parentSession: originSessionFile,
+				withSession: async (newCtx) => {
+					await newCtx.sendUserMessage(instruction);
+					await newCtx.waitForIdle();
+					const draft = getLatestAssistantTextFromBranch(newCtx).trim();
+
+					if (!originSessionFile) {
+						await reviewAndRewriteDailyFileLoop(newCtx, draft);
+						return;
+					}
+
+					await newCtx.switchSession(originSessionFile, {
+						withSession: async (originCtx) => {
+							await reviewAndRewriteDailyFileLoop(originCtx, draft);
+							originCtx.ui.notify("Journal reconcile draft was generated in an isolated session", "info");
+						},
+					});
+				},
+			});
+		},
+	});
+
+	pi.registerCommand("journal-eod", {
+		description: "Generate an EOD note with only missing follow-ups/loose ends not already in journal",
+		handler: async (_args, ctx) => {
+			const { vaultDir, filePath, fileExists } = resolveDailyFile(ctx.cwd);
+			if (!(await ensureVaultDir(ctx, vaultDir))) return;
+
+			const todayDate = getTodayDateString();
+			const project = getProjectName(ctx.cwd);
+			const dailyLink = getTodayDailyLink();
+			const originSessionFile = ctx.sessionManager.getSessionFile();
+			const { messages, scannedSessionCount, contributingSessionCount } = collectTodayMessagesAcrossSessions(ctx, todayDate);
+			const transcript = buildSessionTranscript(messages, 180);
+			const existingContent = fileExists ? readFileSync(filePath, "utf-8") : "";
+
+			if (!existingContent.trim() && messages.length === 0) {
+				ctx.ui.notify("No journal content or session activity found for today.", "warning");
+				return;
+			}
+
+			const instruction = buildEodMissingInstruction({
+				project,
+				cwd: ctx.cwd,
+				filePath,
+				fileExists,
+				existingContent,
+				dailyLink,
+				todayDate,
+				sessionCount: scannedSessionCount,
+				contributingSessionCount,
+				transcript,
+			});
+
+			await ctx.newSession({
+				parentSession: originSessionFile,
+				withSession: async (newCtx) => {
+					await newCtx.sendUserMessage(instruction);
+					await newCtx.waitForIdle();
+					const draft = getLatestAssistantTextFromBranch(newCtx).trim();
+
+					if (!originSessionFile) {
+						await reviewAndWriteLoop(newCtx, draft, undefined);
+						return;
+					}
+
+					await newCtx.switchSession(originSessionFile, {
+						withSession: async (originCtx) => {
+							await reviewAndWriteLoop(originCtx, draft, undefined);
+							originCtx.ui.notify("EOD missing-items draft was generated in an isolated session", "info");
+						},
+					});
+				},
+			});
+		},
+	});
+
+	pi.registerCommand("journal-date", {
+		description: "Run reconcile + EOD-missing for a specific date (YYYY-MM-DD)",
+		handler: async (args, ctx) => {
+			const targetDate = args.trim();
+			if (!targetDate || !isIsoDateString(targetDate)) {
+				ctx.ui.notify("Usage: /journal-date YYYY-MM-DD", "warning");
+				return;
+			}
+			await runReconcileAndEodForDate({
+				ctx,
+				targetDate,
+				noActivityMessage: `No journal content or session activity found for ${targetDate}.`,
+				completionMessage: `${targetDate} reconcile + EOD drafts generated in an isolated session`,
+			});
+		},
+	});
+
+	pi.registerCommand("journal-yesterday", {
+		description: "Run yesterday reconcile + EOD-missing in one flow",
+		handler: async (_args, ctx) => {
+			const targetDate = getDateString(-1);
+			await runReconcileAndEodForDate({
+				ctx,
+				targetDate,
+				noActivityMessage: "No journal content or session activity found for yesterday.",
+				completionMessage: "Yesterday reconcile + EOD drafts generated in an isolated session",
+			});
 		},
 	});
 
