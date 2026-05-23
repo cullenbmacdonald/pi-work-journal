@@ -926,7 +926,8 @@ async function runReconcileAndEodForDate(params: {
 	completionMessage: string;
 }): Promise<void> {
 	const { pi, ctx, targetDate, noActivityMessage, completionMessage } = params;
-	await withConfiguredJournalModel(pi, ctx, async () => {
+	try {
+		await withConfiguredJournalModel(pi, ctx, async () => {
 		const { vaultDir, filePath, fileExists } = resolveDatedFile(ctx.cwd, targetDate);
 		if (!(await ensureVaultDir(ctx, vaultDir))) return;
 
@@ -964,39 +965,51 @@ async function runReconcileAndEodForDate(params: {
 				await newCtx.waitForIdle();
 				const reconcileDraft = getLatestAssistantTextFromBranch(newCtx).trim();
 
-				const eodInstruction = buildEodMissingInstruction({
-					project,
-					cwd: ctx.cwd,
-					filePath,
-					fileExists: true,
-					existingContent: reconcileDraft || existingContent,
-					dailyLink,
-					todayDate: targetDate,
-					sessionCount: scannedSessionCount,
-					contributingSessionCount,
-					transcript,
-				});
-				await newCtx.sendUserMessage(eodInstruction);
-				await newCtx.waitForIdle();
-				const eodDraft = getLatestAssistantTextFromBranch(newCtx).trim();
+				let eodDraft = "";
+				try {
+					const eodInstruction = buildEodMissingInstruction({
+						project,
+						cwd: ctx.cwd,
+						filePath,
+						fileExists: true,
+						existingContent: reconcileDraft || existingContent,
+						dailyLink,
+						todayDate: targetDate,
+						sessionCount: scannedSessionCount,
+						contributingSessionCount,
+						transcript,
+					});
+					await newCtx.sendUserMessage(eodInstruction);
+					await newCtx.waitForIdle();
+					eodDraft = getLatestAssistantTextFromBranch(newCtx).trim();
+				} catch (e) {
+					newCtx.ui.notify(`EOD generation failed; continuing with reconcile write only: ${e}`, "warning");
+				}
 				const eodRange = getLastMessageRange(messages);
 
 				if (!originSessionFile) {
 					await reviewAndRewriteDailyFileLoop(newCtx, reconcileDraft, targetDate);
-					await reviewAndWriteLoop(newCtx, eodDraft, eodRange, targetDate);
+					if (eodDraft) {
+						await reviewAndWriteLoop(newCtx, eodDraft, eodRange, targetDate);
+					}
 					return;
 				}
 
 				await newCtx.switchSession(originSessionFile, {
 					withSession: async (originCtx) => {
 						await reviewAndRewriteDailyFileLoop(originCtx, reconcileDraft, targetDate);
-						await reviewAndWriteLoop(originCtx, eodDraft, eodRange, targetDate);
+						if (eodDraft) {
+							await reviewAndWriteLoop(originCtx, eodDraft, eodRange, targetDate);
+						}
 						originCtx.ui.notify(completionMessage, "info");
 					},
 				});
 			},
 		});
-	});
+		});
+	} catch (e) {
+		ctx.ui.notify(`Journal reconcile flow failed: ${e}`, "error");
+	}
 }
 
 export const __testables = {
