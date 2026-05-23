@@ -1,16 +1,105 @@
 # pi-work-journal
 
-A standalone [Pi](https://pi.dev) extension package for writing daily work journal entries to a local vault (e.g. Obsidian).
+A standalone [Pi](https://pi.dev) extension package for maintaining a daily work journal in a local vault (for example, Obsidian).
 
-## Features
+It supports:
 
-- `/journal` — runs journal drafting in an isolated session, shows an overlay review UI, and returns you to your original session.
-- `/journal-write <markdown>` — manually write an entry (heading/timestamp/project formatting is applied automatically).
-- `/journal-config` — show resolved configuration and today's target file.
-- `/journal-reconcile` — rewrites today's full journal by reconciling all of today's Pi sessions + existing journal content, splitting entries at major time gaps.
-- `/journal-eod` — appends an end-of-day note with only missing follow-ups/loose ends/TODOs not already covered by the day log.
-- `/journal-yesterday` — runs yesterday's reconcile + missing-only EOD flow in one command for catch-up.
-- `/journal-date YYYY-MM-DD` — runs reconcile + missing-only EOD for a specific date.
+- quick in-session journaling (`/journal`)
+- full-day reconstruction (`/journal-reconcile`)
+- end-of-day missing-item checks (`/journal-eod`)
+- catch-up runs for missed days (`/journal-yesterday`, `/journal-date YYYY-MM-DD`)
+
+---
+
+## How it works
+
+The extension writes to a date-based markdown file in your configured `vaultPath`.
+
+### Entry format
+
+For normal entries, it writes headings like:
+
+```md
+### HH:MM or HH:MM–HH:MM — <project>: <title>
+```
+
+and separates appended entries with:
+
+```md
+---
+```
+
+### Generation flow
+
+For generation commands, it:
+
+1. gathers session/journal context,
+2. generates a draft in an isolated Pi session,
+3. returns you to your original session,
+4. opens a review overlay (**Write / Edit / Cancel**),
+5. writes the result to the target day file.
+
+---
+
+## Commands
+
+### `/journal`
+Drafts a journal entry from the **current branch/session context** and appends it to today’s file.
+
+Use this during the day when you remember to log progress.
+
+### `/journal-write <markdown>`
+Manually append an entry. The extension still applies heading/timestamp/project formatting automatically.
+
+### `/journal-reconcile`
+Performs a **full reconcile for today**:
+
+- scans all today’s Pi sessions,
+- reads today’s current journal,
+- detects major work segments from message time gaps,
+- generates a reconstructed full-day file,
+- **rewrites today’s file** so it reads like you journaled at key moments.
+
+### `/journal-eod`
+Performs an **EOD missing-only pass for today**:
+
+- compares today’s session activity vs today’s full journal,
+- appends only missing follow-ups/loose ends/TODOs,
+- avoids re-listing things already captured.
+
+### `/journal-yesterday`
+Runs yesterday catch-up in one command:
+
+1. reconcile yesterday’s full log,
+2. append yesterday’s missing-only EOD note.
+
+### `/journal-date YYYY-MM-DD`
+Same as `/journal-yesterday`, but for any explicit date.
+
+Example:
+
+```bash
+/journal-date 2026-05-21
+```
+
+### `/journal-config`
+Shows resolved config and target file details.
+
+---
+
+## Recommended workflow
+
+Typical daily flow:
+
+1. Use `/journal` a few times during the day when possible.
+2. Run `/journal-reconcile` later (afternoon/evening) to rebuild missing structure.
+3. Run `/journal-eod` at end of day to capture only missing loose ends/follow-ups.
+
+If you forgot end-of-day:
+
+- run `/journal-yesterday` the next morning (or `/journal-date YYYY-MM-DD`).
+
+---
 
 ## Install
 
@@ -25,6 +114,8 @@ From local path:
 ```bash
 pi install /Users/you/dev/pi-work-journal
 ```
+
+---
 
 ## Configuration
 
