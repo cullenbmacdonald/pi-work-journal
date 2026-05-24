@@ -131,6 +131,20 @@ describe("work-journal helpers", () => {
 		const good = "# 2026-05-22\n\n### 09:00 — proj: Start";
 		expect(testables.isValidReconcileDraft(good, "2026-05-22")).toBe(true);
 	});
+
+	it("captures latest assistant snapshot with entry id", () => {
+		const fakeCtx: any = {
+			sessionManager: {
+				getBranch: () => [
+					{ type: "message", id: "1", message: { role: "assistant", content: "older" } },
+					{ type: "message", id: "2", message: { role: "assistant", content: "latest" } },
+				],
+			},
+		};
+		const snap = testables.getLatestAssistantSnapshotFromBranch(fakeCtx);
+		expect(snap.entryId).toBe("2");
+		expect(snap.text).toBe("latest");
+	});
 });
 
 describe("extractMessagesFromSessionFile", () => {

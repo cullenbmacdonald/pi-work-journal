@@ -472,16 +472,20 @@ function isValidReconcileDraft(draft: string, targetDate?: string): boolean {
 	return true;
 }
 
-function getLatestAssistantTextFromBranch(ctx: ExtensionCommandContext): string {
+function getLatestAssistantSnapshotFromBranch(ctx: ExtensionCommandContext): { entryId?: string; text: string } {
 	const entries = ctx.sessionManager.getBranch();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i] as any;
 		if (entry?.type !== "message") continue;
 		if (entry?.message?.role !== "assistant") continue;
 		const text = extractMessageText(entry.message).trim();
-		if (text) return text;
+		if (text) return { entryId: entry?.id, text };
 	}
-	return "";
+	return { text: "" };
+}
+
+function getLatestAssistantTextFromBranch(ctx: ExtensionCommandContext): string {
+	return getLatestAssistantSnapshotFromBranch(ctx).text;
 }
 
 function extractTitleAndBody(content: string): { title: string; body: string } {
@@ -1007,6 +1011,7 @@ async function runReconcileAndEodForDate(params: {
 
 				let eodDraft = "";
 				try {
+					const beforeEod = getLatestAssistantSnapshotFromBranch(newCtx);
 					const eodInstruction = buildEodMissingInstruction({
 						project,
 						cwd: ctx.cwd,
@@ -1021,7 +1026,15 @@ async function runReconcileAndEodForDate(params: {
 					});
 					await newCtx.sendUserMessage(eodInstruction);
 					await newCtx.waitForIdle();
-					eodDraft = getLatestAssistantTextFromBranch(newCtx).trim();
+					const afterEod = getLatestAssistantSnapshotFromBranch(newCtx);
+					if (!afterEod.text || (beforeEod.entryId && afterEod.entryId === beforeEod.entryId)) {
+						throw new Error("No new assistant output for EOD step");
+					}
+					eodDraft = normalizeModelMarkdownOutput(afterEod.text);
+					if (!/^title\s*:/i.test(eodDraft)) {
+						newCtx.ui.notify("EOD output was not in expected `Title:` format; skipping EOD write.", "warning");
+						eodDraft = "";
+					}
 				} catch (e) {
 					newCtx.ui.notify(`EOD generation failed; continuing with reconcile write only: ${e}`, "warning");
 				}
@@ -1063,6 +1076,7 @@ export const __testables = {
 	normalizeModelMarkdownOutput,
 	normalizeReconcileDraft,
 	isValidReconcileDraft,
+	getLatestAssistantSnapshotFromBranch,
 	extractMessagesFromSessionFile,
 	getAllSessionFilePaths,
 	collectMessagesAcrossAllSessions,
