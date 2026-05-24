@@ -1224,9 +1224,10 @@ async function reviewAndWriteWeeklyReviewLoop(
 interface SessionPromptContext {
 	cwd: string;
 	ui: ExtensionCommandContext["ui"];
-	sessionManager: Pick<ExtensionCommandContext["sessionManager"], "getBranch">;
+	sessionManager: Pick<ExtensionCommandContext["sessionManager"], "getBranch" | "getSessionFile">;
 	sendUserMessage: (content: string) => Promise<void>;
 	waitForIdle: () => Promise<void>;
+	newSession: ExtensionCommandContext["newSession"];
 }
 
 async function ensureWeekWorklogs(params: {
@@ -1280,16 +1281,22 @@ async function ensureWeekWorklogs(params: {
 			transcript,
 		});
 
+		ctx.ui.notify(`Reconciling missing worklog for ${date}...`, "info");
 		let draft = "";
 		try {
-			const before = getLatestAssistantSnapshotFromBranch(ctx);
-			await ctx.sendUserMessage(instruction);
-			await ctx.waitForIdle();
-			const after = getLatestAssistantSnapshotFromBranch(ctx);
-			if (!after.text || (before.entryId && after.entryId === before.entryId)) {
-				throw new Error("No new assistant output for reconcile step");
-			}
-			draft = after.text.trim();
+			const parentSession = ctx.sessionManager.getSessionFile();
+			await ctx.newSession({
+				parentSession,
+				withSession: async (dateCtx) => {
+					await dateCtx.sendUserMessage(instruction);
+					await dateCtx.waitForIdle();
+					const result = getLatestAssistantTextFromBranch(dateCtx);
+					if (!result) {
+						throw new Error("No assistant output for reconcile step");
+					}
+					draft = result.trim();
+				},
+			});
 		} catch (e) {
 			ctx.ui.notify(`Could not auto-reconcile missing day ${date}: ${e}`, "warning");
 			failedDates.push(date);

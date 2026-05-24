@@ -236,25 +236,35 @@ describe("ensureWeekWorklogs", () => {
 			makeMessageEntry("assistant", "implemented", ts + 60000),
 		]);
 
-		const branch: any[] = [];
 		let id = 1;
 		const fakeCtx: any = {
 			cwd,
 			ui: { notify: vi.fn() },
-			sessionManager: { getBranch: () => branch },
-			sendUserMessage: vi.fn(async (instruction: string) => {
-				const m = instruction.match(/Line 1 must be exactly: # (\d{4}-\d{2}-\d{2})/);
-				const target = m?.[1] || day;
-				branch.push({
-					type: "message",
-					id: String(id++),
-					message: {
-						role: "assistant",
-						content: `# ${target}\n\n### 10:00–10:10 — test: Reconciled\n\n- did work`,
-					},
-				});
-			}),
+			sessionManager: { getBranch: () => [], getSessionFile: () => "parent.jsonl" },
+			sendUserMessage: vi.fn(async () => {}),
 			waitForIdle: vi.fn(async () => {}),
+			newSession: vi.fn(async ({ withSession }: any) => {
+				const dateBranch: any[] = [];
+				const dateCtx: any = {
+					cwd,
+					ui: { notify: vi.fn() },
+					sessionManager: { getBranch: () => dateBranch, getSessionFile: () => "date.jsonl" },
+					sendUserMessage: vi.fn(async (instruction: string) => {
+						const m = instruction.match(/Line 1 must be exactly: # (\d{4}-\d{2}-\d{2})/);
+						const target = m?.[1] || day;
+						dateBranch.push({
+							type: "message",
+							id: String(id++),
+							message: {
+								role: "assistant",
+								content: `# ${target}\n\n### 10:00–10:10 — test: Reconciled\n\n- did work`,
+							},
+						});
+					}),
+					waitForIdle: vi.fn(async () => {}),
+				};
+				await withSession(dateCtx);
+			}),
 		};
 
 		const result = await testables.ensureWeekWorklogs({ ctx: fakeCtx, startDate: day, endDate: day });
@@ -323,6 +333,7 @@ describe("journal-weekly-review command", () => {
 				editor: vi.fn(async () => ""),
 			},
 			modelRegistry: { find: vi.fn() },
+			model: undefined,
 			sessionManager: {
 				getSessionFile: () => "origin.jsonl",
 				getBranch: () => [],
@@ -333,10 +344,31 @@ describe("journal-weekly-review command", () => {
 					ui: { notify: vi.fn() },
 					sessionManager: {
 						getBranch: () => newBranch,
+						getSessionFile: () => "weekly.jsonl",
 					},
 					sendUserMessage: sendInNewCtx,
 					waitForIdle: vi.fn(async () => {}),
-					switchSession: vi.fn(async ({}, { withSession: withOrigin }: any) => withOrigin(originCtx)),
+					switchSession: vi.fn(async (_path: string, { withSession: withOrigin }: any) => withOrigin(originCtx)),
+					newSession: vi.fn(async ({ withSession: withDateSession }: any) => {
+						const dateBranch: any[] = [];
+						const dateCtx: any = {
+							cwd,
+							ui: { notify: vi.fn() },
+							sessionManager: { getBranch: () => dateBranch, getSessionFile: () => "date.jsonl" },
+							sendUserMessage: vi.fn(async (instruction: string) => {
+								sendInNewCtx(instruction);
+								const m = instruction.match(/Line 1 must be exactly: # (\d{4}-\d{2}-\d{2})/);
+								const target = m?.[1] || activeDay;
+								dateBranch.push({
+									type: "message",
+									id: String(id++),
+									message: { role: "assistant", content: `# ${target}\n\n### 09:00 — test: Reconciled\n\n- done` },
+								});
+							}),
+							waitForIdle: vi.fn(async () => {}),
+						};
+						await withDateSession(dateCtx);
+					}),
 				};
 				await withSession(newCtx);
 			}),
