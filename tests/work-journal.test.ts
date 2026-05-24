@@ -1,6 +1,7 @@
 import { beforeAll, afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const FAKE_AGENT_DIR = "/tmp/pi-work-journal-test-agent";
 
@@ -22,6 +23,7 @@ vi.mock(
 );
 
 let testables: Awaited<ReturnType<typeof loadTestables>>;
+const TEMP_DIRS: string[] = [];
 
 async function loadTestables() {
 	const mod = await import("../extensions/work-journal");
@@ -35,6 +37,9 @@ beforeAll(async () => {
 afterEach(() => {
 	if (existsSync(FAKE_AGENT_DIR)) {
 		rmSync(FAKE_AGENT_DIR, { recursive: true, force: true });
+	}
+	for (const dir of TEMP_DIRS.splice(0, TEMP_DIRS.length)) {
+		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 	}
 });
 
@@ -57,6 +62,19 @@ function makeMessageEntry(role: string, text: string, timestamp: number) {
 			timestamp,
 		},
 	};
+}
+
+function createProjectWithVault() {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-work-journal-cwd-"));
+	const vault = mkdtempSync(join(tmpdir(), "pi-work-journal-vault-"));
+	mkdirSync(join(cwd, ".pi"), { recursive: true });
+	writeFileSync(
+		join(cwd, ".pi", "work-journal.json"),
+		JSON.stringify({ vaultPath: vault, filePattern: "{{date}}-worklog.md" }),
+		"utf-8",
+	);
+	TEMP_DIRS.push(cwd, vault);
+	return { cwd, vault };
 }
 
 describe("work-journal helpers", () => {
@@ -180,6 +198,72 @@ describe("work-journal helpers", () => {
 		const snap = testables.getLatestAssistantSnapshotFromBranch(fakeCtx);
 		expect(snap.entryId).toBe("2");
 		expect(snap.text).toBe("latest");
+	});
+});
+
+describe("ensureWeekWorklogs", () => {
+	it("creates placeholder worklog when a day has no Pi session activity", async () => {
+		const { cwd, vault } = createProjectWithVault();
+		const branch: any[] = [];
+		const fakeCtx: any = {
+			cwd,
+			ui: { notify: vi.fn() },
+			sessionManager: { getBranch: () => branch },
+			sendUserMessage: vi.fn(async () => {}),
+			waitForIdle: vi.fn(async () => {}),
+		};
+
+		const result = await testables.ensureWeekWorklogs({
+			ctx: fakeCtx,
+			startDate: "2026-05-19",
+			endDate: "2026-05-19",
+		});
+
+		expect(result.noActivityDates).toEqual(["2026-05-19"]);
+		expect(result.createdDates).toHaveLength(0);
+		expect(result.failedDates).toHaveLength(0);
+		const outPath = join(vault, "2026-05-19-worklog.md");
+		expect(existsSync(outPath)).toBe(true);
+		expect(readFileSync(outPath, "utf-8")).toContain("No recorded work");
+		expect(fakeCtx.sendUserMessage).not.toHaveBeenCalled();
+	});
+
+	it("auto-reconciles a missing day when Pi activity exists", async () => {
+		const { cwd, vault } = createProjectWithVault();
+		const day = "2026-05-20";
+		const ts = Date.parse("2026-05-20T10:00:00.000Z");
+		createSessionFile("--project-auto--", "s1.jsonl", [
+			makeMessageEntry("user", "did work", ts),
+			makeMessageEntry("assistant", "implemented", ts + 60000),
+		]);
+
+		const branch: any[] = [];
+		let id = 1;
+		const fakeCtx: any = {
+			cwd,
+			ui: { notify: vi.fn() },
+			sessionManager: { getBranch: () => branch },
+			sendUserMessage: vi.fn(async (instruction: string) => {
+				const m = instruction.match(/Line 1 must be exactly: # (\d{4}-\d{2}-\d{2})/);
+				const target = m?.[1] || day;
+				branch.push({
+					type: "message",
+					id: String(id++),
+					message: {
+						role: "assistant",
+						content: `# ${target}\n\n### 10:00–10:10 — test: Reconciled\n\n- did work`,
+					},
+				});
+			}),
+			waitForIdle: vi.fn(async () => {}),
+		};
+
+		const result = await testables.ensureWeekWorklogs({ ctx: fakeCtx, startDate: day, endDate: day });
+		expect(result.createdDates).toEqual([day]);
+		expect(result.failedDates).toHaveLength(0);
+		const outPath = join(vault, `${day}-worklog.md`);
+		expect(readFileSync(outPath, "utf-8")).toContain("# 2026-05-20");
+		expect(readFileSync(outPath, "utf-8")).toContain("Reconciled");
 	});
 });
 

@@ -1217,11 +1217,10 @@ async function reviewAndWriteWeeklyReviewLoop(
 
 async function ensureWeekWorklogs(params: {
 	ctx: ExtensionCommandContext;
-	originSessionFile?: string;
 	startDate: string;
 	endDate: string;
 }): Promise<{ createdDates: string[]; noActivityDates: string[]; failedDates: string[] }> {
-	const { ctx, originSessionFile, startDate, endDate } = params;
+	const { ctx, startDate, endDate } = params;
 	const missingDates = getMissingDailyWorklogDates(ctx.cwd, startDate, endDate);
 	if (missingDates.length === 0) {
 		return { createdDates: [], noActivityDates: [], failedDates: [] };
@@ -1269,14 +1268,14 @@ async function ensureWeekWorklogs(params: {
 
 		let draft = "";
 		try {
-			await ctx.newSession({
-				parentSession: originSessionFile,
-				withSession: async (newCtx) => {
-					await newCtx.sendUserMessage(instruction);
-					await newCtx.waitForIdle();
-					draft = getLatestAssistantTextFromBranch(newCtx).trim();
-				},
-			});
+			const before = getLatestAssistantSnapshotFromBranch(ctx);
+			await ctx.sendUserMessage(instruction);
+			await ctx.waitForIdle();
+			const after = getLatestAssistantSnapshotFromBranch(ctx);
+			if (!after.text || (before.entryId && after.entryId === before.entryId)) {
+				throw new Error("No new assistant output for reconcile step");
+			}
+			draft = after.text.trim();
 		} catch (e) {
 			ctx.ui.notify(`Could not auto-reconcile missing day ${date}: ${e}`, "warning");
 			failedDates.push(date);
@@ -1421,6 +1420,9 @@ export const __testables = {
 	getAllSessionFilePaths,
 	collectMessagesAcrossAllSessions,
 	collectMessagesAcrossAllSessionsInRange,
+	ensureWeekWorklogs,
+	getMissingDailyWorklogDates,
+	hasUsableDailyJournalContent,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -1664,7 +1666,6 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Ensuring daily worklogs exist for ${startDate} → ${endDate}...`, "info");
 				const reconciliation = await ensureWeekWorklogs({
 					ctx,
-					originSessionFile,
 					startDate,
 					endDate,
 				});
