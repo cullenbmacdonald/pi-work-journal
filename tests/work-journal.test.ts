@@ -5,24 +5,17 @@ import { tmpdir } from "node:os";
 
 const FAKE_AGENT_DIR = "/tmp/pi-work-journal-test-agent";
 
-vi.mock(
-	"@earendil-works/pi-coding-agent",
-	() => ({
-		getAgentDir: () => FAKE_AGENT_DIR,
-	}),
-	{ virtual: true },
-);
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+	getAgentDir: () => FAKE_AGENT_DIR,
+}));
 
-vi.mock(
-	"@earendil-works/pi-tui",
-	() => ({
-		matchesKey: () => false,
-		visibleWidth: (s: string) => s.length,
-	}),
-	{ virtual: true },
-);
+vi.mock("@earendil-works/pi-tui", () => ({
+	matchesKey: () => false,
+	visibleWidth: (s: string) => s.length,
+}));
 
 let testables: Awaited<ReturnType<typeof loadTestables>>;
+let extensionFactory: Awaited<ReturnType<typeof loadExtensionFactory>>;
 const TEMP_DIRS: string[] = [];
 
 async function loadTestables() {
@@ -30,8 +23,14 @@ async function loadTestables() {
 	return mod.__testables;
 }
 
+async function loadExtensionFactory() {
+	const mod = await import("../extensions/work-journal");
+	return mod.default;
+}
+
 beforeAll(async () => {
 	testables = await loadTestables();
+	extensionFactory = await loadExtensionFactory();
 });
 
 afterEach(() => {
@@ -264,6 +263,89 @@ describe("ensureWeekWorklogs", () => {
 		const outPath = join(vault, `${day}-worklog.md`);
 		expect(readFileSync(outPath, "utf-8")).toContain("# 2026-05-20");
 		expect(readFileSync(outPath, "utf-8")).toContain("Reconciled");
+	});
+});
+
+describe("journal-weekly-review command", () => {
+	it("runs missing-day reconcile inside newSession context (not command ctx)", async () => {
+		const { cwd, vault } = createProjectWithVault();
+
+		// Seed one day with activity so ensureWeekWorklogs must prompt the model.
+		const activeDay = "2026-05-18";
+		const ts = Date.parse("2026-05-18T09:00:00.000Z");
+		createSessionFile("--weekly-cmd--", "s1.jsonl", [
+			makeMessageEntry("user", "kickoff", ts),
+			makeMessageEntry("assistant", "implemented", ts + 30000),
+		]);
+
+		const commands = new Map<string, any>();
+		const fakePi: any = {
+			registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+			setModel: vi.fn(async () => true),
+		};
+		extensionFactory(fakePi);
+		const weekly = commands.get("journal-weekly-review");
+		expect(weekly).toBeTruthy();
+
+		const newBranch: any[] = [];
+		let id = 1;
+		const sendInNewCtx = vi.fn(async (instruction: string) => {
+			if (instruction.includes("Line 1 must be exactly: # ")) {
+				const m = instruction.match(/Line 1 must be exactly: # (\d{4}-\d{2}-\d{2})/);
+				const day = m?.[1] || activeDay;
+				newBranch.push({
+					type: "message",
+					id: String(id++),
+					message: { role: "assistant", content: `# ${day}\n\n### 09:00 — test: Reconciled\n\n- done` },
+				});
+				return;
+			}
+			if (instruction.includes("# Weekly Review:")) {
+				const m = instruction.match(/# Weekly Review: (\d{4}-\d{2}-\d{2}) → (\d{4}-\d{2}-\d{2})/);
+				const start = m?.[1] || "2026-05-18";
+				const end = m?.[2] || "2026-05-24";
+				newBranch.push({
+					type: "message",
+					id: String(id++),
+					message: {
+						role: "assistant",
+						content: `# Weekly Review: ${start} → ${end}\n\n## Highlights\n- shipped\n\n## Lowlights\n- context switching\n\n## Uncompleted work\n- [ ] follow up\n\n## Monday restart context\n- triage`,
+					},
+				});
+			}
+		});
+
+		const originCtx: any = {
+			cwd,
+			ui: {
+				notify: vi.fn(),
+				custom: vi.fn(async () => "cancel"),
+				editor: vi.fn(async () => ""),
+			},
+			modelRegistry: { find: vi.fn() },
+			sessionManager: {
+				getSessionFile: () => "origin.jsonl",
+				getBranch: () => [],
+			},
+			newSession: vi.fn(async ({ withSession }: any) => {
+				const newCtx: any = {
+					cwd,
+					ui: { notify: vi.fn() },
+					sessionManager: {
+						getBranch: () => newBranch,
+					},
+					sendUserMessage: sendInNewCtx,
+					waitForIdle: vi.fn(async () => {}),
+					switchSession: vi.fn(async ({}, { withSession: withOrigin }: any) => withOrigin(originCtx)),
+				};
+				await withSession(newCtx);
+			}),
+		};
+
+		await expect(weekly.handler("2026-05-18", originCtx)).resolves.toBeUndefined();
+		expect(sendInNewCtx).toHaveBeenCalled();
+		// If command ctx were incorrectly used, this would throw before reaching here.
+		expect(existsSync(join(vault, "2026-05-18-worklog.md"))).toBe(true);
 	});
 });
 

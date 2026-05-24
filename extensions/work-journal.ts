@@ -606,7 +606,13 @@ function isValidWeeklyReviewDraft(draft: string, startDate: string, endDate: str
 	return true;
 }
 
-function getLatestAssistantSnapshotFromBranch(ctx: ExtensionCommandContext): { entryId?: string; text: string } {
+interface BranchContextLike {
+	sessionManager: {
+		getBranch: () => any[];
+	};
+}
+
+function getLatestAssistantSnapshotFromBranch(ctx: BranchContextLike): { entryId?: string; text: string } {
 	const entries = ctx.sessionManager.getBranch();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i] as any;
@@ -618,7 +624,7 @@ function getLatestAssistantSnapshotFromBranch(ctx: ExtensionCommandContext): { e
 	return { text: "" };
 }
 
-function getLatestAssistantTextFromBranch(ctx: ExtensionCommandContext): string {
+function getLatestAssistantTextFromBranch(ctx: BranchContextLike): string {
 	return getLatestAssistantSnapshotFromBranch(ctx).text;
 }
 
@@ -1000,11 +1006,11 @@ class JournalReviewOverlay implements Focusable {
 			this.scrollBy(1);
 			return;
 		}
-		if (matchesKey(data, "pageup")) {
+		if (matchesKey(data, "pageup" as any)) {
 			this.scrollBy(-this.previewWindow);
 			return;
 		}
-		if (matchesKey(data, "pagedown")) {
+		if (matchesKey(data, "pagedown" as any)) {
 			this.scrollBy(this.previewWindow);
 			return;
 		}
@@ -1215,8 +1221,16 @@ async function reviewAndWriteWeeklyReviewLoop(
 	}
 }
 
+interface SessionPromptContext {
+	cwd: string;
+	ui: ExtensionCommandContext["ui"];
+	sessionManager: Pick<ExtensionCommandContext["sessionManager"], "getBranch">;
+	sendUserMessage: (content: string) => Promise<void>;
+	waitForIdle: () => Promise<void>;
+}
+
 async function ensureWeekWorklogs(params: {
-	ctx: ExtensionCommandContext;
+	ctx: SessionPromptContext;
 	startDate: string;
 	endDate: string;
 }): Promise<{ createdDates: string[]; noActivityDates: string[]; failedDates: string[] }> {
@@ -1663,53 +1677,53 @@ export default function (pi: ExtensionAPI) {
 				const project = getProjectName(ctx.cwd);
 				const originSessionFile = ctx.sessionManager.getSessionFile();
 
-				ctx.ui.notify(`Ensuring daily worklogs exist for ${startDate} → ${endDate}...`, "info");
-				const reconciliation = await ensureWeekWorklogs({
-					ctx,
-					startDate,
-					endDate,
-				});
-
-				if (reconciliation.createdDates.length > 0) {
-					ctx.ui.notify(`Auto-reconciled missing worklogs: ${reconciliation.createdDates.join(", ")}`, "info");
-				}
-				if (reconciliation.noActivityDates.length > 0) {
-					ctx.ui.notify(`Created no-activity worklogs: ${reconciliation.noActivityDates.join(", ")}`, "info");
-				}
-				if (reconciliation.failedDates.length > 0) {
-					ctx.ui.notify(
-						`Could not reconcile all missing worklogs (${reconciliation.failedDates.join(", ")}). Weekly review aborted.`,
-						"error",
-					);
-					return;
-				}
-
-				const existingDailyJournals = collectExistingJournalContentInRange(ctx.cwd, startDate, endDate);
-				const existingWeeklyReviewContent = fileExists ? readFileSync(filePath, "utf-8") : "";
-				const weekDays = getDateStringsInRange(startDate, endDate);
-				const dailyLinks = weekDays.map((d) => getDailyLink(d)).join(" ");
-				const worklogDayCount = weekDays.length - getMissingDailyWorklogDates(ctx.cwd, startDate, endDate).length;
-
-				if (!existingDailyJournals.trim() && !existingWeeklyReviewContent.trim()) {
-					ctx.ui.notify(`No worklog content found for week ${startDate} → ${endDate}.`, "warning");
-					return;
-				}
-
-				const instruction = buildWeeklyReviewInstruction({
-					project,
-					cwd: ctx.cwd,
-					filePath,
-					startDate,
-					endDate,
-					worklogDayCount,
-					dailyLinks,
-					existingWeeklyReviewContent,
-					existingDailyJournals,
-				});
-
 				await ctx.newSession({
 					parentSession: originSessionFile,
 					withSession: async (newCtx) => {
+						newCtx.ui.notify(`Ensuring daily worklogs exist for ${startDate} → ${endDate}...`, "info");
+						const reconciliation = await ensureWeekWorklogs({
+							ctx: newCtx,
+							startDate,
+							endDate,
+						});
+
+						if (reconciliation.createdDates.length > 0) {
+							newCtx.ui.notify(`Auto-reconciled missing worklogs: ${reconciliation.createdDates.join(", ")}`, "info");
+						}
+						if (reconciliation.noActivityDates.length > 0) {
+							newCtx.ui.notify(`Created no-activity worklogs: ${reconciliation.noActivityDates.join(", ")}`, "info");
+						}
+						if (reconciliation.failedDates.length > 0) {
+							newCtx.ui.notify(
+								`Could not reconcile all missing worklogs (${reconciliation.failedDates.join(", ")}). Weekly review aborted.`,
+								"error",
+							);
+							return;
+						}
+
+						const existingDailyJournals = collectExistingJournalContentInRange(newCtx.cwd, startDate, endDate);
+						const existingWeeklyReviewContent = fileExists ? readFileSync(filePath, "utf-8") : "";
+						const weekDays = getDateStringsInRange(startDate, endDate);
+						const dailyLinks = weekDays.map((d) => getDailyLink(d)).join(" ");
+						const worklogDayCount = weekDays.length - getMissingDailyWorklogDates(newCtx.cwd, startDate, endDate).length;
+
+						if (!existingDailyJournals.trim() && !existingWeeklyReviewContent.trim()) {
+							newCtx.ui.notify(`No worklog content found for week ${startDate} → ${endDate}.`, "warning");
+							return;
+						}
+
+						const instruction = buildWeeklyReviewInstruction({
+							project,
+							cwd: newCtx.cwd,
+							filePath,
+							startDate,
+							endDate,
+							worklogDayCount,
+							dailyLinks,
+							existingWeeklyReviewContent,
+							existingDailyJournals,
+						});
+
 						await newCtx.sendUserMessage(instruction);
 						await newCtx.waitForIdle();
 						const draft = getLatestAssistantTextFromBranch(newCtx).trim();
