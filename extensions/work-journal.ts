@@ -104,6 +104,38 @@ function isIsoDateString(value: string): boolean {
 	return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
 }
 
+function toIsoDateUtc(date: Date): string {
+	return date.toISOString().slice(0, 10);
+}
+
+function getWeekRangeForDate(referenceDate: string): { startDate: string; endDate: string } {
+	const base = new Date(`${referenceDate}T00:00:00.000Z`);
+	const day = base.getUTCDay();
+	const daysSinceMonday = (day + 6) % 7;
+
+	const start = new Date(base);
+	start.setUTCDate(base.getUTCDate() - daysSinceMonday);
+
+	const end = new Date(start);
+	end.setUTCDate(start.getUTCDate() + 6);
+
+	return { startDate: toIsoDateUtc(start), endDate: toIsoDateUtc(end) };
+}
+
+function getDateStringsInRange(startDate: string, endDate: string): string[] {
+	const start = new Date(`${startDate}T00:00:00.000Z`);
+	const end = new Date(`${endDate}T00:00:00.000Z`);
+	if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) return [];
+
+	const days: string[] = [];
+	const cursor = new Date(start);
+	while (cursor <= end) {
+		days.push(toIsoDateUtc(cursor));
+		cursor.setUTCDate(cursor.getUTCDate() + 1);
+	}
+	return days;
+}
+
 function getDailyLink(dateString: string): string {
 	return `[[${dateString}]]`;
 }
@@ -151,6 +183,18 @@ function resolveDailyFile(cwd: string): {
 	fileExists: boolean;
 } {
 	return resolveDatedFile(cwd, getTodayDateString());
+}
+
+function resolveWeeklyReviewFile(cwd: string, startDate: string, endDate: string): {
+	config: WorkJournalConfig;
+	vaultDir: string;
+	filePath: string;
+	fileExists: boolean;
+} {
+	const config = loadConfig(cwd);
+	const vaultDir = expandHome(config.vaultPath);
+	const filePath = join(vaultDir, `${startDate}_to_${endDate}-weekly-review.md`);
+	return { config, vaultDir, filePath, fileExists: existsSync(filePath) };
 }
 
 async function ensureVaultDir(ctx: ExtensionCommandContext, vaultDir: string): Promise<boolean> {
@@ -298,7 +342,7 @@ function getAllSessionFilePaths(): string[] {
 	return files;
 }
 
-function extractMessagesFromSessionFile(filePath: string, targetDate: string): MessageSlice[] {
+function extractMessagesFromSessionFileInRange(filePath: string, startDate: string, endDate: string): MessageSlice[] {
 	const messages: MessageSlice[] = [];
 	let raw = "";
 	try {
@@ -326,7 +370,8 @@ function extractMessagesFromSessionFile(filePath: string, targetDate: string): M
 		const fallbackTs = new Date(entry?.timestamp).getTime();
 		const timestampMs = typeof tsFromMessage === "number" ? tsFromMessage : fallbackTs;
 		if (!Number.isFinite(timestampMs)) continue;
-		if (!new Date(timestampMs).toISOString().startsWith(targetDate)) continue;
+		const messageDate = new Date(timestampMs).toISOString().slice(0, 10);
+		if (messageDate < startDate || messageDate > endDate) continue;
 
 		messages.push({
 			role,
@@ -337,6 +382,10 @@ function extractMessagesFromSessionFile(filePath: string, targetDate: string): M
 	}
 
 	return messages;
+}
+
+function extractMessagesFromSessionFile(filePath: string, targetDate: string): MessageSlice[] {
+	return extractMessagesFromSessionFileInRange(filePath, targetDate, targetDate);
 }
 
 function collectTodayMessagesAcrossSessions(ctx: ExtensionCommandContext, targetDate: string): {
@@ -367,7 +416,7 @@ function collectTodayMessagesAcrossSessions(ctx: ExtensionCommandContext, target
 	return { messages, scannedSessionCount: files.length, contributingSessionCount: contributing };
 }
 
-function collectMessagesAcrossAllSessions(targetDate: string): {
+function collectMessagesAcrossAllSessionsInRange(startDate: string, endDate: string): {
 	messages: MessageSlice[];
 	scannedSessionCount: number;
 	contributingSessionCount: number;
@@ -377,7 +426,7 @@ function collectMessagesAcrossAllSessions(targetDate: string): {
 	let contributing = 0;
 
 	for (const filePath of files) {
-		const extracted = extractMessagesFromSessionFile(filePath, targetDate);
+		const extracted = extractMessagesFromSessionFileInRange(filePath, startDate, endDate);
 		if (extracted.length > 0) {
 			contributing++;
 			all.push(...extracted);
@@ -392,6 +441,14 @@ function collectMessagesAcrossAllSessions(targetDate: string): {
 
 	const messages = [...deduped.values()].sort((a, b) => a.timestampMs - b.timestampMs);
 	return { messages, scannedSessionCount: files.length, contributingSessionCount: contributing };
+}
+
+function collectMessagesAcrossAllSessions(targetDate: string): {
+	messages: MessageSlice[];
+	scannedSessionCount: number;
+	contributingSessionCount: number;
+} {
+	return collectMessagesAcrossAllSessionsInRange(targetDate, targetDate);
 }
 
 function splitIntoWorkSegments(messages: MessageSlice[], gapMinutes = 90): WorkSegment[] {
@@ -444,6 +501,35 @@ function writeFullDailyJournalFile(cwd: string, fullMarkdown: string, targetDate
 	return { filePath };
 }
 
+function collectExistingJournalContentInRange(cwd: string, startDate: string, endDate: string): string {
+	const days = getDateStringsInRange(startDate, endDate);
+	const chunks: string[] = [];
+	for (const day of days) {
+		const { filePath, fileExists } = resolveDatedFile(cwd, day);
+		if (!fileExists) continue;
+		let content = "";
+		try {
+			content = readFileSync(filePath, "utf-8").trim();
+		} catch {
+			continue;
+		}
+		if (!content) continue;
+		chunks.push(`## ${day}\n${content.slice(0, 3500)}${content.length > 3500 ? "\n... (truncated)" : ""}`);
+	}
+	return chunks.join("\n\n");
+}
+
+function writeWeeklyReviewFile(cwd: string, fullMarkdown: string, startDate: string, endDate: string): { filePath: string } {
+	const { vaultDir, filePath } = resolveWeeklyReviewFile(cwd, startDate, endDate);
+	if (!existsSync(vaultDir)) {
+		mkdirSync(vaultDir, { recursive: true });
+	}
+
+	const normalized = fullMarkdown.trim().replace(/\s+$/g, "");
+	writeFileSync(filePath, `${normalized}\n`, "utf-8");
+	return { filePath };
+}
+
 function normalizeModelMarkdownOutput(raw: string): string {
 	let draft = raw.trim();
 	const fenced = draft.match(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/i);
@@ -469,6 +555,24 @@ function isValidReconcileDraft(draft: string, targetDate?: string): boolean {
 	if (!normalized) return false;
 	if (targetDate && !normalized.startsWith(`# ${targetDate}`)) return false;
 	if (!/^#\s+\d{4}-\d{2}-\d{2}/.test(normalized)) return false;
+	return true;
+}
+
+function normalizeWeeklyReviewDraft(raw: string, startDate: string, endDate: string): string {
+	const draft = normalizeModelMarkdownOutput(raw);
+	const header = `# Weekly Review: ${startDate} → ${endDate}`;
+	const idx = draft.indexOf(header);
+	if (idx >= 0) return draft.slice(idx).trim();
+	return draft;
+}
+
+function isValidWeeklyReviewDraft(draft: string, startDate: string, endDate: string): boolean {
+	const normalized = draft.trim();
+	if (!normalized) return false;
+	if (!normalized.startsWith(`# Weekly Review: ${startDate} → ${endDate}`)) return false;
+	if (!normalized.includes("## Highlights")) return false;
+	if (!normalized.includes("## Lowlights")) return false;
+	if (!normalized.includes("## Uncompleted work")) return false;
 	return true;
 }
 
@@ -750,6 +854,87 @@ function buildEodMissingInstruction(params: {
 	].join("\n");
 }
 
+function buildWeeklyReviewInstruction(params: {
+	project: string;
+	cwd: string;
+	filePath: string;
+	startDate: string;
+	endDate: string;
+	sessionCount: number;
+	contributingSessionCount: number;
+	dailyLinks: string;
+	existingWeeklyReviewContent: string;
+	existingDailyJournals: string;
+	transcript: string;
+}): string {
+	const {
+		project,
+		cwd,
+		filePath,
+		startDate,
+		endDate,
+		sessionCount,
+		contributingSessionCount,
+		dailyLinks,
+		existingWeeklyReviewContent,
+		existingDailyJournals,
+		transcript,
+	} = params;
+
+	return [
+		"Create a weekly review markdown file from Pi activity and existing daily journals.",
+		"",
+		"Goal: help the user quickly regain context on Monday morning.",
+		"",
+		"## Output format (strict)",
+		"",
+		`Line 1 must be exactly: # Weekly Review: ${startDate} → ${endDate}`,
+		"Then include these sections in order:",
+		"- ## Highlights",
+		"- ## Lowlights",
+		"- ## Uncompleted work",
+		"- ## Monday restart context",
+		"",
+		"Section rules:",
+		"- Highlights: 5-10 bullets of key wins/results.",
+		"- Lowlights: blockers, regressions, friction, risks.",
+		"- Uncompleted work: checkbox tasks (`- [ ] ...`) only.",
+		"- Monday restart context: concise plan with first 3 actions.",
+		"- Deduplicate aggressively.",
+		"",
+		"Use [[wikilinks]] where useful.",
+		`Include these daily links somewhere: ${dailyLinks}`,
+		"",
+		"## Context",
+		`Project: ${project} (${cwd})`,
+		`Week range: ${startDate} → ${endDate}`,
+		`Target file: ${filePath}`,
+		`Sessions scanned: ${sessionCount} (${contributingSessionCount} with activity this week)`,
+		"",
+		existingWeeklyReviewContent
+			? [
+					"Existing weekly review file content (truncated):",
+					"```",
+					existingWeeklyReviewContent.slice(0, 5000),
+					existingWeeklyReviewContent.length > 5000 ? "\n... (truncated)" : "",
+					"```",
+			  ].join("\n")
+			: "No weekly review file currently exists for this range.",
+		"",
+		"Existing daily journal files in range (truncated):",
+		"```",
+		existingDailyJournals || "(none)",
+		"```",
+		"",
+		"Session transcript excerpts in range:",
+		"```",
+		transcript || "(none)",
+		"```",
+		"",
+		"Return ONLY final markdown file contents. No code fences.",
+	].join("\n");
+}
+
 type ReviewAction = "write" | "edit" | "cancel";
 
 class JournalReviewOverlay implements Focusable {
@@ -962,6 +1147,52 @@ async function reviewAndRewriteDailyFileLoop(
 	}
 }
 
+async function reviewAndWriteWeeklyReviewLoop(
+	ctx: ExtensionCommandContext,
+	draftInitial: string,
+	startDate: string,
+	endDate: string,
+): Promise<void> {
+	let draft = normalizeWeeklyReviewDraft(draftInitial, startDate, endDate);
+	if (!draft) {
+		ctx.ui.notify("Weekly review generation failed: no assistant output found.", "error");
+		return;
+	}
+
+	let done = false;
+	while (!done) {
+		const action = await reviewDraftWithOverlay(ctx, draft);
+		if (action === "cancel") {
+			ctx.ui.notify("Weekly review cancelled", "warning");
+			done = true;
+			continue;
+		}
+		if (action === "edit") {
+			const edited = await ctx.ui.editor("Edit weekly review", draft);
+			if (edited?.trim()) {
+				draft = edited.trim();
+			}
+			continue;
+		}
+
+		if (!isValidWeeklyReviewDraft(draft, startDate, endDate)) {
+			ctx.ui.notify(
+				"Weekly review draft is missing required structure (`# Weekly Review: ...`, highlights/lowlights/uncompleted). Please edit before writing.",
+				"warning",
+			);
+			const edited = await ctx.ui.editor("Edit weekly review", draft);
+			if (edited?.trim()) {
+				draft = normalizeWeeklyReviewDraft(edited.trim(), startDate, endDate);
+			}
+			continue;
+		}
+
+		const result = writeWeeklyReviewFile(ctx.cwd, draft, startDate, endDate);
+		ctx.ui.notify(`✅ Weekly review written:\n${result.filePath}`, "info");
+		done = true;
+	}
+}
+
 async function runReconcileAndEodForDate(params: {
 	pi: ExtensionAPI;
 	ctx: ExtensionCommandContext;
@@ -1068,18 +1299,24 @@ async function runReconcileAndEodForDate(params: {
 export const __testables = {
 	isIsoDateString,
 	resolveFilename,
+	getWeekRangeForDate,
+	getDateStringsInRange,
 	extractTitleAndBody,
 	splitIntoWorkSegments,
 	formatSegmentsForPrompt,
 	buildReconcileInstruction,
 	buildEodMissingInstruction,
+	buildWeeklyReviewInstruction,
 	normalizeModelMarkdownOutput,
 	normalizeReconcileDraft,
+	normalizeWeeklyReviewDraft,
 	isValidReconcileDraft,
+	isValidWeeklyReviewDraft,
 	getLatestAssistantSnapshotFromBranch,
 	extractMessagesFromSessionFile,
 	getAllSessionFilePaths,
 	collectMessagesAcrossAllSessions,
+	collectMessagesAcrossAllSessionsInRange,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -1299,6 +1536,73 @@ export default function (pi: ExtensionAPI) {
 				targetDate,
 				noActivityMessage: "No journal content or session activity found for yesterday.",
 				completionMessage: "Yesterday reconcile + EOD drafts generated in an isolated session",
+			});
+		},
+	});
+
+	pi.registerCommand("journal-weekly-review", {
+		description: "Generate a weekly review (highlights/lowlights/uncompleted) for the week containing an optional date",
+		handler: async (args, ctx) => {
+			await withConfiguredJournalModel(pi, ctx, async () => {
+				const argDate = args.trim();
+				if (argDate && !isIsoDateString(argDate)) {
+					ctx.ui.notify("Usage: /journal-weekly-review [YYYY-MM-DD]", "warning");
+					return;
+				}
+				const referenceDate = argDate || getTodayDateString();
+				const { startDate, endDate } = getWeekRangeForDate(referenceDate);
+				const { vaultDir, filePath, fileExists } = resolveWeeklyReviewFile(ctx.cwd, startDate, endDate);
+				if (!(await ensureVaultDir(ctx, vaultDir))) return;
+
+				const project = getProjectName(ctx.cwd);
+				const originSessionFile = ctx.sessionManager.getSessionFile();
+				const { messages, scannedSessionCount, contributingSessionCount } = collectMessagesAcrossAllSessionsInRange(startDate, endDate);
+				const transcript = buildSessionTranscript(messages, 320);
+				const existingDailyJournals = collectExistingJournalContentInRange(ctx.cwd, startDate, endDate);
+				const existingWeeklyReviewContent = fileExists ? readFileSync(filePath, "utf-8") : "";
+				const dailyLinks = getDateStringsInRange(startDate, endDate)
+					.map((d) => getDailyLink(d))
+					.join(" ");
+
+				if (!messages.length && !existingDailyJournals.trim() && !existingWeeklyReviewContent.trim()) {
+					ctx.ui.notify(`No session or journal activity found for week ${startDate} → ${endDate}.`, "warning");
+					return;
+				}
+
+				const instruction = buildWeeklyReviewInstruction({
+					project,
+					cwd: ctx.cwd,
+					filePath,
+					startDate,
+					endDate,
+					sessionCount: scannedSessionCount,
+					contributingSessionCount,
+					dailyLinks,
+					existingWeeklyReviewContent,
+					existingDailyJournals,
+					transcript,
+				});
+
+				await ctx.newSession({
+					parentSession: originSessionFile,
+					withSession: async (newCtx) => {
+						await newCtx.sendUserMessage(instruction);
+						await newCtx.waitForIdle();
+						const draft = getLatestAssistantTextFromBranch(newCtx).trim();
+
+						if (!originSessionFile) {
+							await reviewAndWriteWeeklyReviewLoop(newCtx, draft, startDate, endDate);
+							return;
+						}
+
+						await newCtx.switchSession(originSessionFile, {
+							withSession: async (originCtx) => {
+								await reviewAndWriteWeeklyReviewLoop(originCtx, draft, startDate, endDate);
+								originCtx.ui.notify("Weekly review draft was generated in an isolated session", "info");
+							},
+						});
+					},
+				});
 			});
 		},
 	});

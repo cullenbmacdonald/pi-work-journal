@@ -73,6 +73,17 @@ describe("work-journal helpers", () => {
 		expect(testables.isIsoDateString("not-a-date")).toBe(false);
 	});
 
+	it("builds monday-sunday week range from a reference date", () => {
+		const range = testables.getWeekRangeForDate("2026-05-22"); // Friday
+		expect(range.startDate).toBe("2026-05-18");
+		expect(range.endDate).toBe("2026-05-24");
+	});
+
+	it("expands date ranges inclusively", () => {
+		const dates = testables.getDateStringsInRange("2026-05-18", "2026-05-20");
+		expect(dates).toEqual(["2026-05-18", "2026-05-19", "2026-05-20"]);
+	});
+
 	it("extracts title/body from explicit title format", () => {
 		const input = "Title: Fix session carryover\n\nUpdated prompt handling.";
 		const result = testables.extractTitleAndBody(input);
@@ -112,6 +123,33 @@ describe("work-journal helpers", () => {
 		expect(text).toContain("ONLY items missing");
 		expect(text).toContain("Title: EOD missing items");
 		expect(text).toContain("If everything is already covered");
+	});
+
+	it("builds weekly review instruction", () => {
+		const text = testables.buildWeeklyReviewInstruction({
+			project: "pi-work-journal",
+			cwd: "/tmp/pi-work-journal",
+			filePath: "/tmp/journal/2026-05-18_to_2026-05-24-weekly-review.md",
+			startDate: "2026-05-18",
+			endDate: "2026-05-24",
+			sessionCount: 8,
+			contributingSessionCount: 5,
+			dailyLinks: "[[2026-05-18]] [[2026-05-19]]",
+			existingWeeklyReviewContent: "",
+			existingDailyJournals: "# 2026-05-18\n...",
+			transcript: "[2026-05-18T09:00:00.000Z] user: ...",
+		});
+
+		expect(text).toContain("Weekly Review: 2026-05-18 → 2026-05-24");
+		expect(text).toContain("## Uncompleted work");
+		expect(text).toContain("Monday restart context");
+	});
+
+	it("normalizes and validates weekly review drafts", () => {
+		const draft = "```markdown\n# Weekly Review: 2026-05-18 → 2026-05-24\n\n## Highlights\n- a\n\n## Lowlights\n- b\n\n## Uncompleted work\n- [ ] c\n\n## Monday restart context\n- d\n```";
+		const normalized = testables.normalizeWeeklyReviewDraft(draft, "2026-05-18", "2026-05-24");
+		expect(normalized.startsWith("# Weekly Review: 2026-05-18 → 2026-05-24")).toBe(true);
+		expect(testables.isValidWeeklyReviewDraft(normalized, "2026-05-18", "2026-05-24")).toBe(true);
 	});
 
 	it("normalizes fenced markdown model output", () => {
@@ -254,6 +292,19 @@ describe("collectMessagesAcrossAllSessions", () => {
 		// Should be sorted by timestamp
 		expect(result.messages[0].text).toBe("started work on feature X");
 		expect(result.messages[3].text).toBe("looks good");
+	});
+
+	it("collects messages across a date range", () => {
+		createSessionFile("--project-range--", "s1.jsonl", [
+			makeMessageEntry("user", "monday", Date.parse("2026-05-18T09:00:00.000Z")),
+			makeMessageEntry("assistant", "wednesday", Date.parse("2026-05-20T09:00:00.000Z")),
+			makeMessageEntry("user", "next week", Date.parse("2026-05-25T09:00:00.000Z")),
+		]);
+
+		const result = testables.collectMessagesAcrossAllSessionsInRange("2026-05-18", "2026-05-24");
+		expect(result.messages).toHaveLength(2);
+		expect(result.messages[0].text).toBe("monday");
+		expect(result.messages[1].text).toBe("wednesday");
 	});
 
 	it("deduplicates identical messages", () => {

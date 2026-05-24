@@ -8,6 +8,7 @@ It supports:
 - full-day reconstruction (`/journal-reconcile`)
 - end-of-day missing-item checks (`/journal-eod`)
 - catch-up runs for missed days (`/journal-yesterday`, `/journal-date YYYY-MM-DD`)
+- end-of-week summaries (`/journal-weekly-review [YYYY-MM-DD]`)
 
 ---
 
@@ -99,6 +100,29 @@ Example:
 /journal-date 2026-05-21
 ```
 
+### `/journal-weekly-review [YYYY-MM-DD]`
+Generates a weekly review file for the week containing the provided date (defaults to current week).
+
+It scans all Pi sessions plus daily journal files in that week and produces:
+
+- highlights
+- lowlights
+- uncompleted work (`- [ ]` checkboxes)
+- Monday restart context
+
+Output file path pattern:
+
+```text
+<vaultPath>/<week-start>_to_<week-end>-weekly-review.md
+```
+
+Example:
+
+```bash
+/journal-weekly-review
+/journal-weekly-review 2026-05-22
+```
+
 ### `/journal-config`
 Shows resolved config and target file details.
 
@@ -115,6 +139,10 @@ Typical daily flow:
 If you forgot end-of-day:
 
 - run `/journal-yesterday` the next morning (or `/journal-date YYYY-MM-DD`).
+
+End of week:
+
+- run `/journal-weekly-review` to generate a full-week summary for Monday context reset.
 
 ---
 
