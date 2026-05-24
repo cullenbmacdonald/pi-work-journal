@@ -103,7 +103,13 @@ Example:
 ### `/journal-weekly-review [YYYY-MM-DD]`
 Generates a weekly review file for the week containing the provided date (defaults to current week).
 
-It scans all Pi sessions plus daily journal files in that week and produces:
+Before generating the weekly review, it ensures there is a daily worklog for every day in that week:
+
+1. checks for missing daily worklogs,
+2. auto-runs reconcile for missing days (or writes a "no recorded work" placeholder when there is no Pi activity),
+3. then generates the weekly review from the full set of daily worklogs.
+
+Weekly output includes:
 
 - highlights
 - lowlights

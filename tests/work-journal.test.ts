@@ -132,12 +132,10 @@ describe("work-journal helpers", () => {
 			filePath: "/tmp/journal/2026-05-18_to_2026-05-24-weekly-review.md",
 			startDate: "2026-05-18",
 			endDate: "2026-05-24",
-			sessionCount: 8,
-			contributingSessionCount: 5,
+			worklogDayCount: 7,
 			dailyLinks: "[[2026-05-18]] [[2026-05-19]]",
 			existingWeeklyReviewContent: "",
 			existingDailyJournals: "# 2026-05-18\n...",
-			transcript: "[2026-05-18T09:00:00.000Z] user: ...",
 		});
 
 		expect(text).toContain("Weekly Review: 2026-05-18 → 2026-05-24");

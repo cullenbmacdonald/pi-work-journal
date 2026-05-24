@@ -501,6 +501,13 @@ function writeFullDailyJournalFile(cwd: string, fullMarkdown: string, targetDate
 	return { filePath };
 }
 
+function hasUsableDailyJournalContent(content: string, date: string): boolean {
+	const normalized = content.trim();
+	if (!normalized) return false;
+	const headerOnly = `# ${date}`;
+	return normalized !== headerOnly;
+}
+
 function collectExistingJournalContentInRange(cwd: string, startDate: string, endDate: string): string {
 	const days = getDateStringsInRange(startDate, endDate);
 	const chunks: string[] = [];
@@ -513,10 +520,33 @@ function collectExistingJournalContentInRange(cwd: string, startDate: string, en
 		} catch {
 			continue;
 		}
-		if (!content) continue;
+		if (!hasUsableDailyJournalContent(content, day)) continue;
 		chunks.push(`## ${day}\n${content.slice(0, 3500)}${content.length > 3500 ? "\n... (truncated)" : ""}`);
 	}
 	return chunks.join("\n\n");
+}
+
+function getMissingDailyWorklogDates(cwd: string, startDate: string, endDate: string): string[] {
+	const days = getDateStringsInRange(startDate, endDate);
+	const missing: string[] = [];
+	for (const day of days) {
+		const { filePath, fileExists } = resolveDatedFile(cwd, day);
+		if (!fileExists) {
+			missing.push(day);
+			continue;
+		}
+		let content = "";
+		try {
+			content = readFileSync(filePath, "utf-8");
+		} catch {
+			missing.push(day);
+			continue;
+		}
+		if (!hasUsableDailyJournalContent(content, day)) {
+			missing.push(day);
+		}
+	}
+	return missing;
 }
 
 function writeWeeklyReviewFile(cwd: string, fullMarkdown: string, startDate: string, endDate: string): { filePath: string } {
@@ -860,12 +890,10 @@ function buildWeeklyReviewInstruction(params: {
 	filePath: string;
 	startDate: string;
 	endDate: string;
-	sessionCount: number;
-	contributingSessionCount: number;
+	worklogDayCount: number;
 	dailyLinks: string;
 	existingWeeklyReviewContent: string;
 	existingDailyJournals: string;
-	transcript: string;
 }): string {
 	const {
 		project,
@@ -873,16 +901,14 @@ function buildWeeklyReviewInstruction(params: {
 		filePath,
 		startDate,
 		endDate,
-		sessionCount,
-		contributingSessionCount,
+		worklogDayCount,
 		dailyLinks,
 		existingWeeklyReviewContent,
 		existingDailyJournals,
-		transcript,
 	} = params;
 
 	return [
-		"Create a weekly review markdown file from Pi activity and existing daily journals.",
+		"Create a weekly review markdown file using ONLY the provided daily worklogs.",
 		"",
 		"Goal: help the user quickly regain context on Monday morning.",
 		"",
@@ -901,6 +927,7 @@ function buildWeeklyReviewInstruction(params: {
 		"- Uncompleted work: checkbox tasks (`- [ ] ...`) only.",
 		"- Monday restart context: concise plan with first 3 actions.",
 		"- Deduplicate aggressively.",
+		"- Do not invent work not grounded in the daily logs.",
 		"",
 		"Use [[wikilinks]] where useful.",
 		`Include these daily links somewhere: ${dailyLinks}`,
@@ -909,7 +936,7 @@ function buildWeeklyReviewInstruction(params: {
 		`Project: ${project} (${cwd})`,
 		`Week range: ${startDate} → ${endDate}`,
 		`Target file: ${filePath}`,
-		`Sessions scanned: ${sessionCount} (${contributingSessionCount} with activity this week)`,
+		`Daily worklogs available in range: ${worklogDayCount}`,
 		"",
 		existingWeeklyReviewContent
 			? [
@@ -921,14 +948,9 @@ function buildWeeklyReviewInstruction(params: {
 			  ].join("\n")
 			: "No weekly review file currently exists for this range.",
 		"",
-		"Existing daily journal files in range (truncated):",
+		"Daily worklog files in range (truncated):",
 		"```",
 		existingDailyJournals || "(none)",
-		"```",
-		"",
-		"Session transcript excerpts in range:",
-		"```",
-		transcript || "(none)",
 		"```",
 		"",
 		"Return ONLY final markdown file contents. No code fences.",
@@ -1191,6 +1213,88 @@ async function reviewAndWriteWeeklyReviewLoop(
 		ctx.ui.notify(`✅ Weekly review written:\n${result.filePath}`, "info");
 		done = true;
 	}
+}
+
+async function ensureWeekWorklogs(params: {
+	ctx: ExtensionCommandContext;
+	originSessionFile?: string;
+	startDate: string;
+	endDate: string;
+}): Promise<{ createdDates: string[]; noActivityDates: string[]; failedDates: string[] }> {
+	const { ctx, originSessionFile, startDate, endDate } = params;
+	const missingDates = getMissingDailyWorklogDates(ctx.cwd, startDate, endDate);
+	if (missingDates.length === 0) {
+		return { createdDates: [], noActivityDates: [], failedDates: [] };
+	}
+
+	const createdDates: string[] = [];
+	const noActivityDates: string[] = [];
+	const failedDates: string[] = [];
+	const project = getProjectName(ctx.cwd);
+
+	for (const date of missingDates) {
+		const { filePath } = resolveDatedFile(ctx.cwd, date);
+		const { messages, scannedSessionCount, contributingSessionCount } = collectMessagesAcrossAllSessions(date);
+
+		if (messages.length === 0) {
+			const placeholder = [
+				`# ${date}`,
+				"",
+				`### 00:00 — ${project}: No recorded work`,
+				"",
+				"- No Pi session activity found for this date.",
+				"- [ ] Backfill manually if work happened outside Pi.",
+			].join("\n");
+			writeFullDailyJournalFile(ctx.cwd, placeholder, date);
+			noActivityDates.push(date);
+			continue;
+		}
+
+		const dailyLink = getDailyLink(date);
+		const transcript = buildSessionTranscript(messages, 220);
+		const segments = splitIntoWorkSegments(messages, 90);
+		const segmentsText = formatSegmentsForPrompt(segments);
+		const instruction = buildReconcileInstruction({
+			project,
+			cwd: ctx.cwd,
+			filePath,
+			existingContent: "",
+			dailyLink,
+			todayDate: date,
+			sessionCount: scannedSessionCount,
+			contributingSessionCount,
+			segmentsText,
+			transcript,
+		});
+
+		let draft = "";
+		try {
+			await ctx.newSession({
+				parentSession: originSessionFile,
+				withSession: async (newCtx) => {
+					await newCtx.sendUserMessage(instruction);
+					await newCtx.waitForIdle();
+					draft = getLatestAssistantTextFromBranch(newCtx).trim();
+				},
+			});
+		} catch (e) {
+			ctx.ui.notify(`Could not auto-reconcile missing day ${date}: ${e}`, "warning");
+			failedDates.push(date);
+			continue;
+		}
+
+		const normalized = normalizeReconcileDraft(draft, date);
+		if (!isValidReconcileDraft(normalized, date)) {
+			ctx.ui.notify(`Auto-reconcile returned invalid markdown for ${date}; skipping.`, "warning");
+			failedDates.push(date);
+			continue;
+		}
+
+		writeFullDailyJournalFile(ctx.cwd, normalized, date);
+		createdDates.push(date);
+	}
+
+	return { createdDates, noActivityDates, failedDates };
 }
 
 async function runReconcileAndEodForDate(params: {
@@ -1556,16 +1660,37 @@ export default function (pi: ExtensionAPI) {
 
 				const project = getProjectName(ctx.cwd);
 				const originSessionFile = ctx.sessionManager.getSessionFile();
-				const { messages, scannedSessionCount, contributingSessionCount } = collectMessagesAcrossAllSessionsInRange(startDate, endDate);
-				const transcript = buildSessionTranscript(messages, 320);
+
+				ctx.ui.notify(`Ensuring daily worklogs exist for ${startDate} → ${endDate}...`, "info");
+				const reconciliation = await ensureWeekWorklogs({
+					ctx,
+					originSessionFile,
+					startDate,
+					endDate,
+				});
+
+				if (reconciliation.createdDates.length > 0) {
+					ctx.ui.notify(`Auto-reconciled missing worklogs: ${reconciliation.createdDates.join(", ")}`, "info");
+				}
+				if (reconciliation.noActivityDates.length > 0) {
+					ctx.ui.notify(`Created no-activity worklogs: ${reconciliation.noActivityDates.join(", ")}`, "info");
+				}
+				if (reconciliation.failedDates.length > 0) {
+					ctx.ui.notify(
+						`Could not reconcile all missing worklogs (${reconciliation.failedDates.join(", ")}). Weekly review aborted.`,
+						"error",
+					);
+					return;
+				}
+
 				const existingDailyJournals = collectExistingJournalContentInRange(ctx.cwd, startDate, endDate);
 				const existingWeeklyReviewContent = fileExists ? readFileSync(filePath, "utf-8") : "";
-				const dailyLinks = getDateStringsInRange(startDate, endDate)
-					.map((d) => getDailyLink(d))
-					.join(" ");
+				const weekDays = getDateStringsInRange(startDate, endDate);
+				const dailyLinks = weekDays.map((d) => getDailyLink(d)).join(" ");
+				const worklogDayCount = weekDays.length - getMissingDailyWorklogDates(ctx.cwd, startDate, endDate).length;
 
-				if (!messages.length && !existingDailyJournals.trim() && !existingWeeklyReviewContent.trim()) {
-					ctx.ui.notify(`No session or journal activity found for week ${startDate} → ${endDate}.`, "warning");
+				if (!existingDailyJournals.trim() && !existingWeeklyReviewContent.trim()) {
+					ctx.ui.notify(`No worklog content found for week ${startDate} → ${endDate}.`, "warning");
 					return;
 				}
 
@@ -1575,12 +1700,10 @@ export default function (pi: ExtensionAPI) {
 					filePath,
 					startDate,
 					endDate,
-					sessionCount: scannedSessionCount,
-					contributingSessionCount,
+					worklogDayCount,
 					dailyLinks,
 					existingWeeklyReviewContent,
 					existingDailyJournals,
-					transcript,
 				});
 
 				await ctx.newSession({
