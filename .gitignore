@@ -1,2 +1,9 @@
 node_modules/
 .DS_Store
+
+# Local Pi/project configuration may contain private paths or model preferences
+.pi/
+work-journal.json
+
+# Local package artifacts
+*.tgz

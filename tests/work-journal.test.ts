@@ -433,6 +433,17 @@ describe("extractMessagesFromSessionFile", () => {
 		expect(messages).toHaveLength(1);
 		expect(messages[0].text).toBe("good line");
 	});
+
+	it("skips internal journal generation sessions", () => {
+		const base = Date.parse("2026-05-22T10:00:00.000Z");
+		const filePath = createSessionFile("--project-internal--", "journal.jsonl", [
+			makeMessageEntry("user", "<!-- pi-work-journal:internal-generation-session -->\nReconcile prompt", base),
+			makeMessageEntry("assistant", "# 2026-05-22\n\nGenerated journal", base + 1000),
+		]);
+
+		const messages = testables.extractMessagesFromSessionFile(filePath, "2026-05-22");
+		expect(messages).toHaveLength(0);
+	});
 });
 
 describe("getAllSessionFilePaths", () => {

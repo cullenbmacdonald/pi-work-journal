@@ -18,6 +18,16 @@ The extension writes to a date-based markdown file in your configured `vaultPath
 
 If configured, journal generation commands can also switch to a specific provider/model for drafting (`provider` + `model`).
 
+### Privacy and data flow
+
+This extension is local-first for file storage, but generation commands send selected context to your active/configured Pi model provider so the model can draft journal text.
+
+- `/journal` uses the current branch/session context only.
+- `/journal-reconcile`, `/journal-eod`, `/journal-yesterday`, `/journal-date`, and `/journal-weekly-review` scan Pi session files for the requested date/range and include transcript excerpts in model prompts.
+- Session scans intentionally skip internal journal-generation sessions created by this extension, so previous generated prompts and embedded transcript excerpts are not recursively re-sent in later journal runs.
+- Config files can include local paths and model preferences. Keep personal config out of git; `.pi/` and `work-journal.json` are gitignored here.
+- Project-local config (`<cwd>/.pi/work-journal.json`) overrides global config. Review it before running journal commands in an untrusted repo.
+
 ### Session scanning
 
 Reconcile and EOD commands scan **all** Pi session directories — not just the current project. This means activity across every project you worked on that day is captured in one journal file.
@@ -179,10 +189,10 @@ Example:
 
 ```json
 {
-  "vaultPath": "~/Documents/personal notes/02 - areas/worklogs",
+  "vaultPath": "~/Documents/worklogs",
   "filePattern": "{{date}}-worklog.md",
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-20250514"
+  "provider": "your-provider-id",
+  "model": "your-model-id"
 }
 ```
 

@@ -48,6 +48,11 @@ const DEFAULT_CONFIG: WorkJournalConfig = {
 	filePattern: "{{date}}-worklog.md",
 };
 
+// Journal generation runs in isolated Pi sessions. Tag those prompts so future
+// global session scans do not ingest/re-send prior generated journal prompts,
+// existing journal contents, or transcript excerpts back into new journal runs.
+const INTERNAL_PROMPT_MARKER = "<!-- pi-work-journal:internal-generation-session -->";
+
 function expandHome(p: string): string {
 	if (p.startsWith("~/") || p === "~") {
 		return join(process.env.HOME || "/tmp", p.slice(2));
@@ -348,6 +353,10 @@ function extractMessagesFromSessionFileInRange(filePath: string, startDate: stri
 	try {
 		raw = readFileSync(filePath, "utf-8");
 	} catch {
+		return messages;
+	}
+
+	if (raw.includes(INTERNAL_PROMPT_MARKER)) {
 		return messages;
 	}
 
@@ -700,6 +709,9 @@ function buildJournalInstruction(params: {
 	const { project, cwd, filePath, fileExists, existingContent, dailyLink, timeRange, transcript } = params;
 
 	return [
+		INTERNAL_PROMPT_MARKER,
+		"Do not include the marker above in your output.",
+		"",
 		"Review this session transcript and draft a concise work-journal entry.",
 		"",
 		"## Output format (strict)",
@@ -774,6 +786,9 @@ function buildReconcileInstruction(params: {
 	} = params;
 
 	return [
+		INTERNAL_PROMPT_MARKER,
+		"Do not include the marker above in your output.",
+		"",
 		"Reconstruct and reconcile the FULL daily worklog from today's Pi session activity.",
 		"",
 		"Goal: produce a complete rewritten day log that reads like the user journaled at key moments.",
@@ -844,6 +859,9 @@ function buildEodMissingInstruction(params: {
 	} = params;
 
 	return [
+		INTERNAL_PROMPT_MARKER,
+		"Do not include the marker above in your output.",
+		"",
 		"Create an end-of-day note with ONLY items missing from today's work journal.",
 		"",
 		"Goal: compare today's Pi sessions against the full current worklog and list only follow-ups/loose ends/TODOs not already captured.",
@@ -914,6 +932,9 @@ function buildWeeklyReviewInstruction(params: {
 	} = params;
 
 	return [
+		INTERNAL_PROMPT_MARKER,
+		"Do not include the marker above in your output.",
+		"",
 		"Create a weekly review markdown file using ONLY the provided daily worklogs.",
 		"",
 		"Goal: help the user quickly regain context on Monday morning.",
