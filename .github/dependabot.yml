@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Supply-chain hardening: wait for packages to be at least 7 days old
+    # before Dependabot proposes updates.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
