@@ -742,12 +742,19 @@ function buildJournalInstruction(params: {
 		fileExists
 			? [
 					"",
-					"Existing entries today (truncated):",
+					"## Existing worklog content today",
+					"",
+					"The following content already exists in the worklog file.",
+					"You MUST read this carefully and:",
+					"- Do NOT repeat or duplicate information already covered below.",
+					"- Do NOT duplicate existing TODOs unless adding a clear status update.",
+					"- Focus your entry on NEW work/decisions/learnings from the transcript that are not yet captured.",
+					"- If the transcript only covers work already journaled below, output a very brief entry noting continuation or skip it.",
+					"",
 					"```",
-					existingContent.slice(0, 2000),
-					existingContent.length > 2000 ? "\n... (truncated)" : "",
+					existingContent.slice(0, 5000),
+					existingContent.length > 5000 ? "\n... (truncated)" : "",
 					"```",
-					"Do not duplicate existing TODOs unless adding a clear update.",
 			  ].join("\n")
 			: `No file exists yet for today. First write will create file header automatically (# ${getTodayDateString()}).`,
 		"",
